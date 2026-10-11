@@ -158,6 +158,56 @@ def case_png_screenshot(path):
     doc.close()
 
 
+def case_instructions_then_label(path):
+    """Instructions, a dashed cut line, then the real label lower down.
+
+    The InPost shape. Nothing is drawn round the label, the ink bbox spans the
+    whole sheet, and the label is laid out sideways. The only thing separating
+    the two halves is a dashed rule and a band of whitespace, and the only thing
+    identifying which half matters is that one is full of solid barcode.
+    """
+    doc = fitz.open()
+    p = doc.new_page(width=A4[0], height=A4[1])
+    _text(p, (40, 30, A4[0] - 40, 150),
+          "1. Print this sheet on A4 plain paper.\n"
+          "2. Cut out the label using the horizontal cut-line below as guide.\n"
+          "3. Attach the label to the parcel.\n"
+          "4. Take your parcel to your preferred Locker or Shop.", fontsize=11)
+    _text(p, (40, 180, A4[0] - 40, 215), "Thank you for using the service",
+          fontsize=16)
+    _text(p, (40, 240, A4[0] - 40, 275), "DROP OFF AT LOCKERS OR SHOPS ONLY",
+          fontsize=15, fontname="hebo")
+    _text(p, (40, 285, A4[0] - 40, 315),
+          "This label cannot be accepted at Post Offices or any Post Boxes",
+          fontsize=10)
+
+    # Dashed cut line: deliberately dashed, so longest-continuous-run line
+    # detection cannot see it. Only a span-based test finds this.
+    y = 345
+    x = 20
+    while x < A4[0] - 20:
+        p.draw_line((x, y), (min(x + 7, A4[0] - 20), y), color=(0, 0, 0), width=1)
+        x += 13
+    _text(p, (40, 365, A4[0] - 40, 395),
+          "YOU MUST PRINT AND ATTACH THIS LABEL TO YOUR PARCEL",
+          fontsize=11, color=(0.85, 0, 0), align=1)
+
+    # ...a band of whitespace, then the label, rotated a quarter turn.
+    lbl = fitz.Rect(150, 530, 560, 820)
+    p.draw_rect(fitz.Rect(lbl.x0 + 8, lbl.y0 + 10, lbl.x0 + 30, lbl.y1 - 10),
+                color=None, fill=(0, 0, 0))
+    for x0 in (lbl.x0 + 45, lbl.x0 + 150):
+        _barcode(p, fitz.Rect(x0, lbl.y0 + 12, x0 + 85, lbl.y1 - 12), seed=4)
+    p.draw_rect(fitz.Rect(lbl.x0 + 250, lbl.y0 + 20, lbl.x0 + 300, lbl.y0 + 120),
+                color=None, fill=(0, 0, 0))
+    p.draw_rect(fitz.Rect(lbl.x0 + 250, lbl.y0 + 140, lbl.x0 + 300, lbl.y0 + 200),
+                color=None, fill=(0, 0, 0))
+    _barcode(p, fitz.Rect(lbl.x0 + 320, lbl.y0 + 12, lbl.x0 + 395, lbl.y1 - 12), seed=9)
+    p.draw_line((lbl.x1 - 4, lbl.y0), (lbl.x1 - 4, lbl.y1), color=(0, 0, 0), width=1.5)
+    doc.save(path)
+    doc.close()
+
+
 CASES = [
     ("01-bordered-label-a4", "pdf", case_bordered_a4,
      "bordered carrier label on A4"),
@@ -171,6 +221,8 @@ CASES = [
      "landscape label, needs rotating"),
     ("06-png-screenshot", "png", case_png_screenshot,
      "PNG phone screenshot"),
+    ("07-instructions-then-label", "pdf", case_instructions_then_label,
+     "instructions + cut line, label below"),
 ]
 
 

@@ -91,6 +91,36 @@ DEFAULTS = {
     # ...are dropped if thinner than this fraction of page height. Catches
     # browser print headers, URLs, page numbers, date stamps.
     "EDGE_BAND_FRAC": "0.035",
+    # --- block splitting -----------------------------------------------------
+    # Some carriers put instructions at the top, a cut line, then the real label
+    # lower down (InPost, some Royal Mail). The page then has two separate
+    # regions and the ink bbox spans both, which prints the instructions and
+    # shrinks the label to nothing. These settings find the label.
+    #
+    # A horizontal run of empty rows at least this fraction of the page height
+    # separates one block from the next.
+    "BLOCK_GAP_FRAC": "0.045",
+    # A block must be at least this fraction of the page to be a candidate, so a
+    # stray logo or footer cannot win.
+    "BLOCK_MIN_AREA_FRAC": "0.04",
+    # Blocks are scored on SOLID ink: the fraction of cells dark enough to be a
+    # barcode or a filled block, rather than the thin strokes of text. Measured
+    # on a real InPost label that was 18.5% solid against 2.4% for its page of
+    # instructions, while plain ink *coverage* was 50% against 46% and told you
+    # nothing. Coverage cannot separate text from barcodes; darkness can.
+    #
+    # The winner must beat the runner-up by this factor...
+    "BLOCK_SOLID_RATIO": "2.0",
+    # ...and be at least this solid in absolute terms, so a page of two text
+    # blocks never picks one of them on noise.
+    "BLOCK_SOLID_MIN": "0.05",
+    # A "cut here" line separates blocks even with no whitespace around it. It is
+    # recognised as a thin row spanning at least this much of the page width.
+    # Dashed lines qualify: this measures the span, not a continuous run.
+    "CUTLINE_SPAN_FRAC": "0.80",
+    # ...and being no thicker than this many grid rows, so a wide dense barcode
+    # band is not mistaken for a rule.
+    "CUTLINE_MAX_ROWS": "2",
     # If the detected region covers more than this fraction of the page, the
     # page *is* the content: skip cropping and just fit the page.
     "SKIP_CROP_AREA": "0.85",
@@ -243,11 +273,18 @@ def _ink_grid(page, cfg, fitz):
                           colorspace=fitz.csGRAY, alpha=False)
     gw, gh, stride, buf = pix.width, pix.height, pix.stride, pix.samples
     ink = int(num(cfg, "GRID_INK"))
-    table = bytes(1 if i < ink else 0 for i in range(256))
+    dark = int(num(cfg, "DARK"))
+    t_ink = bytes(1 if i < ink else 0 for i in range(256))
+    # A cell is "solid" when its averaged grey is dark, i.e. it is mostly
+    # covered: a barcode bar or a filled block, not a text stroke.
+    t_solid = bytes(1 if i < dark else 0 for i in range(256))
     grid = bytearray(gw * gh)
+    solid = bytearray(gw * gh)
     for gy in range(gh):
-        grid[gy * gw:(gy + 1) * gw] = buf[gy * stride:gy * stride + gw].translate(table)
-    return grid, gw, gh
+        row = buf[gy * stride:gy * stride + gw]
+        grid[gy * gw:(gy + 1) * gw] = row.translate(t_ink)
+        solid[gy * gw:(gy + 1) * gw] = row.translate(t_solid)
+    return grid, solid, gw, gh
 
 
 def _components(grid, gw, gh):
@@ -290,17 +327,129 @@ def _components(grid, gw, gh):
     return out
 
 
+def find_label_block(grid, solid, gw, gh, cfg):
+    """Pick the one region of a multi-part page that is actually the label.
+
+    Some carriers print instructions at the top, a "cut here" line, then the
+    real label further down. The ink bounding box spans both, so the label ends
+    up a postage stamp in the middle of the roll. This splits the page into
+    horizontal blocks and returns the one that looks like a label.
+
+    Blocks are separated by a band of empty rows, or by a thin full-width rule
+    (a cut line, dashed or solid). The winner is chosen on **ink density**,
+    because a label is dense - barcodes, solid blocks - while instructions are
+    sparse text. It only wins if it beats the runner-up by BLOCK_DENSITY_RATIO;
+    otherwise the page is ambiguous and is left alone, which is the safe
+    outcome.
+
+    Returns a grid-space (x0, y0, x1, y1) box, or None to leave the page alone.
+    """
+    rows = []
+    for gy in range(gh):
+        row = grid[gy * gw:(gy + 1) * gw]
+        n = sum(row)
+        if n:
+            first = next(i for i, v in enumerate(row) if v)
+            last = gw - 1 - next(i for i, v in enumerate(reversed(row)) if v)
+        else:
+            first = last = -1
+        rows.append((n, first, last))
+
+    gap_min = max(1, int(round(num(cfg, "BLOCK_GAP_FRAC") * gh)))
+    cut_span = num(cfg, "CUTLINE_SPAN_FRAC") * gw
+    cut_max = int(num(cfg, "CUTLINE_MAX_ROWS"))
+
+    # Rows that look like a rule: wide span, and part of a thin band. Dashed
+    # counts, because this measures span rather than a continuous run.
+    thin = [False] * gh
+    gy = 0
+    while gy < gh:
+        if rows[gy][0] == 0:
+            gy += 1
+            continue
+        start = gy
+        while gy < gh and rows[gy][0]:
+            gy += 1
+        if gy - start <= cut_max:
+            for i in range(start, gy):
+                if rows[i][2] - rows[i][1] + 1 >= cut_span:
+                    thin[i] = True
+
+    # Split into blocks on empty gaps and on cut lines.
+    blocks, cur = [], []
+    run_empty = 0
+    for gy in range(gh):
+        if thin[gy]:
+            if cur:
+                blocks.append(cur)
+                cur = []
+            run_empty = 0
+            continue
+        if rows[gy][0] == 0:
+            run_empty += 1
+            if run_empty >= gap_min and cur:
+                blocks.append(cur)
+                cur = []
+            continue
+        run_empty = 0
+        cur.append(gy)
+    if cur:
+        blocks.append(cur)
+
+    if len(blocks) < 2:
+        return None
+
+    scored = []
+    for b in blocks:
+        x0 = min(rows[gy][1] for gy in b)
+        x1 = max(rows[gy][2] for gy in b)
+        h, w = len(b), x1 - x0 + 1
+        area = h * w
+        if area <= 0:
+            continue
+        hard = sum(sum(solid[gy * gw + x0:gy * gw + x1 + 1]) for gy in b)
+        scored.append({
+            "box": (x0, b[0], x1 + 1, b[-1] + 1),
+            "solid": hard / float(area),
+            "area_frac": area / float(gw * gh),
+        })
+
+    if len(scored) < 2:
+        return None
+    scored.sort(key=lambda c: c["solid"], reverse=True)
+    best, rest = scored[0], scored[1:]
+    # Compare against the most solid of everything else, whatever its size. The
+    # size test applies only to the winner: a label is never a sliver, but the
+    # things it beats routinely are - instructions often break into several
+    # short paragraphs, and requiring two large blocks to compare missed that.
+    runner = max(c["solid"] for c in rest)
+    ratio = best["solid"] / (runner or 1e-9)
+    log("DEBUG", f"{len(scored)} blocks; solid ink {best['solid']:.1%} vs "
+                 f"{runner:.1%} (x{ratio:.1f}), winner is "
+                 f"{best['area_frac']:.0%} of the page")
+    if best["area_frac"] < num(cfg, "BLOCK_MIN_AREA_FRAC"):
+        log("DEBUG", "the most solid block is too small to be a label")
+        return None
+    if best["solid"] < num(cfg, "BLOCK_SOLID_MIN"):
+        log("DEBUG", "no block is solid enough to be a label, leaving the page")
+        return None
+    if ratio < num(cfg, "BLOCK_SOLID_RATIO"):
+        log("DEBUG", "no block stands out, treating the page as one")
+        return None
+    return best["box"]
+
+
 def find_content_box(page, cfg, fitz):
     """Ink bounding box in page coordinates, with specks and edge strips gone.
 
     Returns (rect_or_None, inked_cell_fraction). The fraction is what the
     blank-page test uses, so the caller gets both from one pass.
     """
-    grid, gw, gh = _ink_grid(page, cfg, fitz)
+    grid, solid, gw, gh = _ink_grid(page, cfg, fitz)
     inked = sum(grid)
     frac = inked / float(gw * gh)
     if not inked:
-        return None, frac
+        return None, frac, (grid, solid, gw, gh)
 
     comps = _components(grid, gw, gh)
     min_cells = max(1, int(round(num(cfg, "SPECK_AREA_FRAC") * gw * gh)))
@@ -335,22 +484,33 @@ def find_content_box(page, cfg, fitz):
         r.x0 + max(c[2] for c in keep) * cw,
         r.y0 + max(c[3] for c in keep) * ch,
     ) & r
-    return box, frac
+    return box, frac, (grid, solid, gw, gh)
 
 
 def detect_page(page, cfg):
     """Work out what to print from one page.
 
-    Order is: drawn border box, else ink bounding box, else the whole page.
+    Order, most specific signal first:
+
+      1. a drawn border box, which is how most carrier labels are delimited
+      2. failing that, the densest block of a page split by cut lines or
+         whitespace, which is how a label sitting under a page of instructions
+         is found
+      3. failing that, the ink bounding box
+      4. and if that covers most of the page, the page *is* the content, so no
+         crop at all
+
+    A drawn border always wins over a density guess: it is an explicit statement
+    about where the label is, whereas block splitting is inference.
 
     Returns (clip_rect_or_None, reason). None means "blank, skip this page".
-    reason is one of: border / content / full-page / blank.
+    reason is one of: border / block / content / full-page / blank.
     """
     fitz = _fitz()
     r = page.rect
     page_area = r.width * r.height or 1.0
 
-    content, frac = find_content_box(page, cfg, fitz)
+    content, frac, (grid, solid, gw, gh) = find_content_box(page, cfg, fitz)
     if content is None or frac < num(cfg, "BLANK_CELL_FRAC"):
         return None, "blank"
 
@@ -362,11 +522,21 @@ def detect_page(page, cfg):
                           colorspace=fitz.csGRAY, alpha=False)
     box = find_border_box(pix, cfg)
 
-    if box is None:
-        clip, reason = content, "content"
+    if box is not None:
+        clip, reason = fitz.Rect(*(v / scale for v in box)) & r, "border"
     else:
-        clip = fitz.Rect(*(v / scale for v in box)) & r
-        reason = "border"
+        # No drawn border. Is this a multi-part page - instructions, a cut
+        # line, then the real label? Only ask here, because inside a bordered
+        # label the gaps between its own sections would split it wrongly.
+        block = find_label_block(grid, solid, gw, gh, cfg)
+        if block is None:
+            clip, reason = content, "content"
+        else:
+            cw, ch = r.width / gw, r.height / gh
+            clip = fitz.Rect(r.x0 + block[0] * cw, r.y0 + block[1] * ch,
+                             r.x0 + block[2] * cw, r.y0 + block[3] * ch) & r
+            clip = clip & content if (clip & content).get_area() > 0 else clip
+            reason = "block"
 
     if clip.get_area() > num(cfg, "SKIP_CROP_AREA") * page_area:
         log("DEBUG", f"{reason} box covers {clip.get_area() / page_area:.0%} "

@@ -39,15 +39,46 @@ Per page, in order:
    axis. That is what separates a real drawn box from four unrelated rules that
    happen to bound a region, and it is why a header rule above a label does not
    become the label's top edge.
-2. **Content bounding box.** Ink bbox on a coarse grid, with connected components
-   used to throw away isolated specks and thin strips hugging the top or bottom
-   edge: browser print headers, URLs, date stamps, page numbers.
-3. **Neither.** If the detected region covers more than 85% of the page, the page
-   *is* the content. No crop, just fit.
+2. **Densest block.** Failing a border, the page is split into horizontal
+   blocks on bands of whitespace and on thin full-width rules, and the block
+   with the most **solid ink** wins. This is the "instructions at the top, cut
+   line, real label underneath" shape that InPost and others use.
+3. **Content bounding box.** Ink bbox on a coarse grid, with connected
+   components used to throw away isolated specks and thin strips hugging the
+   top or bottom edge: browser print headers, URLs, date stamps, page numbers.
+4. **None of the above.** If the detected region covers more than 85% of the
+   page, the page *is* the content. No crop, just fit.
 
 Then rotate to whichever orientation scales larger (but only if it wins by a
 configurable margin, so near-square labels do not flip for a 0.2% gain), scale up
 to fill the printable area, and centre.
+
+A drawn border always wins over the density guess: it is an explicit statement
+about where the label is, whereas block splitting is inference. Getting that
+order wrong makes block splitting fire *inside* a bordered label and crop to
+just its barcode.
+
+### Finding a label under a page of instructions
+
+Some carriers send an A4 sheet of instructions with a dashed "cut here" line and
+the real label below it. The ink bbox spans the whole sheet, so the label comes
+out as a postage stamp in the middle of the roll.
+
+Two things make this detectable, and one obvious thing does not:
+
+- **The cut line is usually dashed**, so longest-continuous-run line detection
+  never sees it. Measuring the *span* of inked pixels across a thin row does.
+- **Ink coverage cannot tell text from barcodes.** On a real InPost label the
+  instructions scored 46% coverage and the label 50%: useless. At this grid
+  resolution a line of text inks nearly every cell it crosses.
+- **Solid ink can.** Scoring cells whose *averaged* grey is genuinely dark,
+  rather than merely non-white, gave 2.4% for the instructions against 18.5%
+  for the label. Barcodes and filled blocks are dark; text is thin strokes on
+  white.
+
+So blocks are scored on solid ink, and the winner must beat the runner-up by
+`BLOCK_SOLID_RATIO` and clear `BLOCK_SOLID_MIN` in absolute terms. If no block
+stands out the page is left alone, which is the safe outcome.
 
 **Every threshold is a fraction of the page, never millimetres.** That is
 deliberate: a phone screenshot is nominally 413x893mm, so mm-based thresholds
@@ -132,6 +163,7 @@ work.
 | `MARGIN_*_MM` | 1.54 / 3.03 | the printer's own unprintable edges |
 | `MAX_PAGES` | 4 | stops a 30-page doc eating the roll |
 | `UPSCALE` / `UPSCALE_MAX` | 1 / 0 | scale small content up to fill, uncapped |
+| `BLOCK_SOLID_RATIO` / `BLOCK_SOLID_MIN` | 2.0 / 0.05 | how clearly a block must stand out to be taken as the label |
 | `KEEP_JOBS` | 5 | in/out PDF pairs retained for debugging |
 
 Changing the config needs no restart. The backend rereads it on every job.
@@ -150,9 +182,9 @@ pip install pymupdf
 python3 test_crop.py /tmp/testout
 ```
 
-Generates six representative inputs (bordered label on A4, label with browser
+Generates seven representative inputs (bordered label on A4, label with browser
 header and footer, full-page text document, two-page PDF with a blank page 2,
-landscape label, PNG screenshot), runs the real detection and placement code, and
+landscape label, PNG screenshot, instructions-then-label), runs the real detection and placement code, and
 writes PNG previews with the detected crop boxed in red beside the output label
 pages.
 
@@ -164,6 +196,7 @@ pages.
 | 2 pages, page 2 blank | border, 1 skipped | 0 |
 | landscape label | border | **90** |
 | PNG screenshot | border | 0 |
+| instructions + cut line, label below | block | **90** |
 
 Run this before deploying any detection change. It is far cheaper than feeding
 the roll. CI runs it on 3.11, 3.12 and 3.13 and uploads the previews as
