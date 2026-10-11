@@ -39,10 +39,10 @@ Per page, in order:
    axis. That is what separates a real drawn box from four unrelated rules that
    happen to bound a region, and it is why a header rule above a label does not
    become the label's top edge.
-2. **Densest block.** Failing a border, the page is split into horizontal
-   blocks on bands of whitespace and on thin full-width rules, and the block
-   with the most **solid ink** wins. This is the "instructions at the top, cut
-   line, real label underneath" shape that InPost and others use.
+2. **The side of a cut line with more solid ink.** Failing a border, if the page
+   carries an explicit "cut here" rule it is split there and the denser side
+   kept. This is the "instructions at the top, cut line, real label underneath"
+   shape that InPost and others use.
 3. **Content bounding box.** Ink bbox on a coarse grid, with connected
    components used to throw away isolated specks and thin strips hugging the
    top or bottom edge: browser print headers, URLs, date stamps, page numbers.
@@ -64,10 +64,26 @@ Some carriers send an A4 sheet of instructions with a dashed "cut here" line and
 the real label below it. The ink bbox spans the whole sheet, so the label comes
 out as a postage stamp in the middle of the roll.
 
-Two things make this detectable, and one obvious thing does not:
+⚠️ **Splitting happens only at an explicit cut rule, never on whitespace alone.**
+That restriction is not fussiness. An earlier version split on whitespace, and a
+borderless label whose address sits above its barcode with as little as a 40pt
+gap was split in two, with the barcode winning on solid ink. The result is a
+printed barcode with no addressee, which is worse than not cropping at all. The
+ratio test gives no protection there, because text scores 0% solid and the ratio
+is effectively infinite.
+
+Three things make this detectable, and one obvious thing does not:
 
 - **The cut line is usually dashed**, so longest-continuous-run line detection
-  never sees it. Measuring the *span* of inked pixels across a thin row does.
+  never sees it: it only ever finds one dash. Measuring the *span* of inked
+  pixels across the row does.
+- **A rule is a local spike in span, not just a wide thin band.** Defining it as
+  the latter matched a bold centred heading at 81% of the page width, and missed
+  the real line, which sat in a nine-row band with the text around it and so
+  never looked thin. The test is a run of up to three rows reaching nearly the
+  full width, with the rows outside the run reaching much less far. The run
+  matters because a rule landing on a cell boundary straddles two grid rows, and
+  each then looks like a wide neighbour of the other.
 - **Ink coverage cannot tell text from barcodes.** On a real InPost label the
   instructions scored 46% coverage and the label 50%: useless. At this grid
   resolution a line of text inks nearly every cell it crosses.
@@ -76,9 +92,19 @@ Two things make this detectable, and one obvious thing does not:
   for the label. Barcodes and filled blocks are dark; text is thin strokes on
   white.
 
-So blocks are scored on solid ink, and the winner must beat the runner-up by
-`BLOCK_SOLID_RATIO` and clear `BLOCK_SOLID_MIN` in absolute terms. If no block
-stands out the page is left alone, which is the safe outcome.
+The kept side must clear `BLOCK_SOLID_MIN` and beat the other side by
+`BLOCK_SOLID_RATIO`. Within it, short bands of pure text are trimmed, which
+removes a "YOU MUST ATTACH THIS LABEL" banner while leaving a multi-line address
+block alone. If nothing stands out the page is left whole, which is the safe
+outcome.
+
+### What the preview shows is not what prints
+
+iOS and macOS render the print preview from the **source document, on the
+client**, before the job is sent. The cropping happens in this backend
+afterwards, so the preview always shows the uncropped original. That is inherent
+to AirPrint and cannot be changed from the printer side. Use the settings page's
+**Re-crop** button to see what will actually come out.
 
 **Every threshold is a fraction of the page, never millimetres.** That is
 deliberate: a phone screenshot is nominally 413x893mm, so mm-based thresholds

@@ -97,9 +97,20 @@ DEFAULTS = {
     # regions and the ink bbox spans both, which prints the instructions and
     # shrinks the label to nothing. These settings find the label.
     #
-    # A horizontal run of empty rows at least this fraction of the page height
-    # separates one block from the next.
+    # ⚠️ Splitting happens ONLY when an explicit "cut here" rule is found, never
+    # on whitespace alone. Whitespace is far too weak a signal: a borderless
+    # label whose address sits above its barcode with a 40pt gap would be split,
+    # and the barcode wins on solid ink, so you print a barcode with no
+    # addressee. That is worse than not cropping at all. A cut line is the
+    # carrier explicitly saying "the label is on one side of this".
+    #
+    # Within the side that wins, a run of empty rows this fraction of the page
+    # high separates trimmable sub-blocks.
     "BLOCK_GAP_FRAC": "0.045",
+    # A sub-block is only trimmed off if it is this short relative to the
+    # region, so a one-line "YOU MUST ATTACH THIS LABEL" banner goes and a
+    # multi-line address block never does.
+    "BLOCK_TRIM_MAX_FRAC": "0.10",
     # A block must be at least this fraction of the page to be a candidate, so a
     # stray logo or footer cannot win.
     "BLOCK_MIN_AREA_FRAC": "0.04",
@@ -117,10 +128,15 @@ DEFAULTS = {
     # A "cut here" line separates blocks even with no whitespace around it. It is
     # recognised as a thin row spanning at least this much of the page width.
     # Dashed lines qualify: this measures the span, not a continuous run.
-    "CUTLINE_SPAN_FRAC": "0.80",
-    # ...and being no thicker than this many grid rows, so a wide dense barcode
-    # band is not mistaken for a rule.
-    "CUTLINE_MAX_ROWS": "2",
+    "CUTLINE_SPAN_FRAC": "0.90",
+    # ...and the rows either side reaching no more than this fraction as far, so
+    # a rule is a local spike. Without this, a bold centred heading spanning 81%
+    # of the width gets taken for a cut line.
+    "CUTLINE_NEIGHBOUR_FRAC": "0.75",
+    # A rule may straddle two grid rows if it lands on a cell boundary, so the
+    # spike is measured over a run of up to this many consecutive wide rows.
+    # Longer than this and it is a block of content, not a line.
+    "CUTLINE_MAX_ROWS": "3",
     # If the detected region covers more than this fraction of the page, the
     # page *is* the content: skip cropping and just fit the page.
     "SKIP_CROP_AREA": "0.85",
@@ -327,24 +343,9 @@ def _components(grid, gw, gh):
     return out
 
 
-def find_label_block(grid, solid, gw, gh, cfg):
-    """Pick the one region of a multi-part page that is actually the label.
-
-    Some carriers print instructions at the top, a "cut here" line, then the
-    real label further down. The ink bounding box spans both, so the label ends
-    up a postage stamp in the middle of the roll. This splits the page into
-    horizontal blocks and returns the one that looks like a label.
-
-    Blocks are separated by a band of empty rows, or by a thin full-width rule
-    (a cut line, dashed or solid). The winner is chosen on **ink density**,
-    because a label is dense - barcodes, solid blocks - while instructions are
-    sparse text. It only wins if it beats the runner-up by BLOCK_DENSITY_RATIO;
-    otherwise the page is ambiguous and is left alone, which is the safe
-    outcome.
-
-    Returns a grid-space (x0, y0, x1, y1) box, or None to leave the page alone.
-    """
-    rows = []
+def _row_profile(grid, gw, gh):
+    """Per-row (ink count, first inked column, last inked column)."""
+    out = []
     for gy in range(gh):
         row = grid[gy * gw:(gy + 1) * gw]
         n = sum(row)
@@ -353,90 +354,141 @@ def find_label_block(grid, solid, gw, gh, cfg):
             last = gw - 1 - next(i for i, v in enumerate(reversed(row)) if v)
         else:
             first = last = -1
-        rows.append((n, first, last))
+        out.append((n, first, last))
+    return out
 
-    gap_min = max(1, int(round(num(cfg, "BLOCK_GAP_FRAC") * gh)))
-    cut_span = num(cfg, "CUTLINE_SPAN_FRAC") * gw
-    cut_max = int(num(cfg, "CUTLINE_MAX_ROWS"))
 
-    # Rows that look like a rule: wide span, and part of a thin band. Dashed
-    # counts, because this measures span rather than a continuous run.
-    thin = [False] * gh
-    gy = 0
+def _cut_rows(rows, gw, gh, cfg):
+    """Rows that look like a "cut here" rule.
+
+    A rule is a *local spike* in how far ink reaches across the row: it runs
+    nearly the full page width while the rows either side of it do not. Two
+    earlier definitions were both wrong on real labels:
+
+      - "longest continuous dark run" misses them entirely, because these lines
+        are nearly always dashed and that only ever sees one dash;
+      - "wide span inside a thin band" matched a bold centred heading (81% of
+        the width) and missed the real line, which sat in a 9-row band with the
+        text around it and so never looked thin.
+
+    Measuring the span and requiring the neighbours to be much narrower catches
+    the line and rejects the heading.
+    """
+    span_min = num(cfg, "CUTLINE_SPAN_FRAC") * gw
+    drop = num(cfg, "CUTLINE_NEIGHBOUR_FRAC")
+    thick_max = int(num(cfg, "CUTLINE_MAX_ROWS"))
+
+    def span(gy):
+        if gy < 0 or gy >= gh or not rows[gy][0]:
+            return 0
+        return rows[gy][2] - rows[gy][1] + 1
+
+    # Group consecutive wide rows into runs. A rule can straddle two grid rows
+    # when it falls on a cell boundary, and testing single rows then makes each
+    # half look like a wide neighbour of the other and finds nothing.
+    cuts, gy = [], 0
     while gy < gh:
-        if rows[gy][0] == 0:
+        if span(gy) < span_min:
             gy += 1
             continue
         start = gy
-        while gy < gh and rows[gy][0]:
+        while gy < gh and span(gy) >= span_min:
             gy += 1
-        if gy - start <= cut_max:
-            for i in range(start, gy):
-                if rows[i][2] - rows[i][1] + 1 >= cut_span:
-                    thin[i] = True
+        run = list(range(start, gy))
+        if len(run) > thick_max:
+            continue          # a wide *block*, not a rule
+        widest = max(span(i) for i in run)
+        if span(start - 1) <= drop * widest and span(gy) <= drop * widest:
+            cuts.append(run[len(run) // 2])
+    return cuts
 
-    # Split into blocks on empty gaps and on cut lines.
-    blocks, cur = [], []
-    run_empty = 0
-    for gy in range(gh):
-        if thin[gy]:
-            if cur:
-                blocks.append(cur)
-                cur = []
-            run_empty = 0
-            continue
-        if rows[gy][0] == 0:
-            run_empty += 1
-            if run_empty >= gap_min and cur:
-                blocks.append(cur)
-                cur = []
-            continue
-        run_empty = 0
-        cur.append(gy)
-    if cur:
-        blocks.append(cur)
 
-    if len(blocks) < 2:
+def _solid_frac(solid, gw, y0, y1):
+    if y1 <= y0:
+        return 0.0
+    return sum(solid[y0 * gw:y1 * gw]) / float((y1 - y0) * gw)
+
+
+def find_label_block(grid, solid, gw, gh, cfg):
+    """Pick the label out of a sheet that also carries instructions.
+
+    Some carriers print a page of instructions, a "cut here" line, then the real
+    label below it. The ink bounding box spans both, so the label ends up a
+    postage stamp in the middle of the roll.
+
+    This splits **only at an explicit cut rule**, never on whitespace alone, and
+    keeps the side with more solid ink: the fraction of the region dark enough
+    to be a barcode or a filled block rather than a text stroke. Plain ink
+    coverage cannot tell those apart - measured on a real InPost label it was
+    46% for the instructions against 50% for the label, while solid ink was 2.4%
+    against 18.5%.
+
+    Within the winning side, short bands of pure text are trimmed, which removes
+    a "YOU MUST ATTACH THIS LABEL" banner without ever touching a multi-line
+    address block.
+
+    Returns a grid-space (x0, y0, x1, y1) box, or None to leave the page alone.
+    """
+    rows = _row_profile(grid, gw, gh)
+    cuts = _cut_rows(rows, gw, gh, cfg)
+    if not cuts:
         return None
 
-    scored = []
-    for b in blocks:
-        x0 = min(rows[gy][1] for gy in b)
-        x1 = max(rows[gy][2] for gy in b)
-        h, w = len(b), x1 - x0 + 1
-        area = h * w
-        if area <= 0:
-            continue
-        hard = sum(sum(solid[gy * gw + x0:gy * gw + x1 + 1]) for gy in b)
-        scored.append({
-            "box": (x0, b[0], x1 + 1, b[-1] + 1),
-            "solid": hard / float(area),
-            "area_frac": area / float(gw * gh),
-        })
-
-    if len(scored) < 2:
-        return None
-    scored.sort(key=lambda c: c["solid"], reverse=True)
-    best, rest = scored[0], scored[1:]
-    # Compare against the most solid of everything else, whatever its size. The
-    # size test applies only to the winner: a label is never a sliver, but the
-    # things it beats routinely are - instructions often break into several
-    # short paragraphs, and requiring two large blocks to compare missed that.
-    runner = max(c["solid"] for c in rest)
-    ratio = best["solid"] / (runner or 1e-9)
-    log("DEBUG", f"{len(scored)} blocks; solid ink {best['solid']:.1%} vs "
-                 f"{runner:.1%} (x{ratio:.1f}), winner is "
-                 f"{best['area_frac']:.0%} of the page")
-    if best["area_frac"] < num(cfg, "BLOCK_MIN_AREA_FRAC"):
-        log("DEBUG", "the most solid block is too small to be a label")
-        return None
-    if best["solid"] < num(cfg, "BLOCK_SOLID_MIN"):
-        log("DEBUG", "no block is solid enough to be a label, leaving the page")
+    # Use the cut that best separates solid ink from the rest.
+    best = None
+    for c in cuts:
+        above, below = _solid_frac(solid, gw, 0, c), _solid_frac(solid, gw, c + 1, gh)
+        hi, lo = max(above, below), min(above, below)
+        ratio = hi / (lo or 1e-9)
+        if best is None or ratio > best[0]:
+            best = (ratio, c, below >= above)
+    ratio, cut, keep_below = best
+    y0, y1 = (cut + 1, gh) if keep_below else (0, cut)
+    kept = _solid_frac(solid, gw, y0, y1)
+    log("DEBUG", f"cut line at row {cut} ({cut / gh:.0%}); keeping "
+                 f"{'below' if keep_below else 'above'}, solid {kept:.1%} "
+                 f"(x{ratio:.1f})")
+    if kept < num(cfg, "BLOCK_SOLID_MIN"):
+        log("DEBUG", "neither side is solid enough to be a label, leaving the page")
         return None
     if ratio < num(cfg, "BLOCK_SOLID_RATIO"):
-        log("DEBUG", "no block stands out, treating the page as one")
+        log("DEBUG", "the cut line does not separate a label, leaving the page")
         return None
-    return best["box"]
+
+    # Trim short pure-text bands (banners) off the kept region.
+    gap_min = max(1, int(round(num(cfg, "BLOCK_GAP_FRAC") * gh)))
+    bands, cur, run = [], [], 0
+    for gy in range(y0, y1):
+        if rows[gy][0] == 0:
+            run += 1
+            if run >= gap_min and cur:
+                bands.append(cur)
+                cur = []
+            continue
+        run = 0
+        cur.append(gy)
+    if cur:
+        bands.append(cur)
+    if not bands:
+        return None
+
+    region_h = max(1, y1 - y0)
+    trim_max = num(cfg, "BLOCK_TRIM_MAX_FRAC") * region_h
+    keep = [b for b in bands
+            if not (len(b) <= trim_max
+                    and _solid_frac(solid, gw, b[0], b[-1] + 1)
+                    < num(cfg, "BLOCK_SOLID_MIN"))]
+    if not keep:
+        keep = bands
+    dropped = len(bands) - len(keep)
+    if dropped:
+        log("DEBUG", f"trimmed {dropped} short text band(s) off the label")
+
+    ys = [gy for b in keep for gy in b]
+    xs = [v for gy in ys for v in (rows[gy][1], rows[gy][2]) if v >= 0]
+    if not xs:
+        return None
+    return (min(xs), ys[0], max(xs) + 1, ys[-1] + 1)
 
 
 def find_content_box(page, cfg, fitz):
