@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""
+Internal settings page for the label proxy.
+
+Edits /etc/labelproxy.conf, shows what the last few jobs actually cropped, and
+can re-run detection with the current settings without printing anything.
+
+    labelui [--port N] [--allow CIDR,CIDR] [--conf PATH] [--backend PATH]
+
+Stdlib only, plus the PyMuPDF already present for the backend. Deliberately
+small: no framework, no database, no JS build, no mDNS advertisement.
+
+Nothing here can consume a label. There is no print path at all.
+"""
+import html
+import importlib.machinery
+import importlib.util
+import ipaddress
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BACKEND = os.environ.get("LABELUI_BACKEND", "/usr/lib/cups/backend/labelcrop")
+CONF = os.environ.get("LABELPROXY_CONF", "/etc/labelproxy.conf")
+PORT = int(os.environ.get("LABELUI_PORT", "8080"))
+# Default is deliberately conservative: loopback only. Set LABELUI_ALLOW in
+# /etc/default/labelui to the networks your clients are actually on.
+ALLOW = os.environ.get("LABELUI_ALLOW", "127.0.0.1/32")
+
+# The backend is the authority for what settings exist and what they default to.
+# Importing it by path because it has no .py extension (it is a CUPS backend).
+_spec = importlib.util.spec_from_loader(
+    "labelcrop", importlib.machinery.SourceFileLoader("labelcrop", BACKEND))
+labelcrop = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(labelcrop)
+
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
+
+
+# ------------------------------------------------------------ presentation ----
+# key -> (group, label, help). Groups: "roll", "behaviour", else Advanced.
+# Anything in labelcrop.DEFAULTS missing from here lands in Advanced on its own,
+# so adding a backend setting can never silently vanish from this page.
+
+FIELDS = {
+    "MEDIA": ("roll", "Media / roll",
+              "Must match the roll actually loaded. The QL reports a default of "
+              "29x90mm whatever is in it, so this has to be explicit."),
+    "FINISHINGS": ("roll", "Cutter",
+                   "The printer's web UI 'Auto Cut' only applies to P-touch "
+                   "Template mode, not AirPrint. This is the one that works."),
+    "LABEL_W_MM": ("roll", "Label width (mm)", ""),
+    "LABEL_H_MM": ("roll", "Label height (mm)", ""),
+    "MARGIN_L_MM": ("roll", "Margin left (mm)", "Printer's unprintable edge."),
+    "MARGIN_R_MM": ("roll", "Margin right (mm)", ""),
+    "MARGIN_T_MM": ("roll", "Margin top (mm)", ""),
+    "MARGIN_B_MM": ("roll", "Margin bottom (mm)", ""),
+
+    "MAX_PAGES": ("behaviour", "Max labels per job",
+                  "Each non-blank page becomes one label. Stops a stray 30-page "
+                  "document eating the roll."),
+    "UPSCALE": ("behaviour", "Scale up to fill",
+                "1 = enlarge small content to fill the label. 0 = only shrink."),
+    "UPSCALE_MAX": ("behaviour", "Max enlargement",
+                    "Cap as a multiple of natural size. 0 = uncapped."),
+    "PAD_MM": ("behaviour", "Inner padding (mm)",
+               "Breathing room inside the printable area."),
+    "CROP_PAD_MM": ("behaviour", "Crop padding (mm)",
+                    "Kept around the detected region so a tight crop does not "
+                    "shave the border line."),
+    "ROTATE_GAIN": ("behaviour", "Rotate threshold",
+                    "Rotating must beat not rotating by this fraction, so "
+                    "near-square labels do not flip for nothing."),
+    "KEEP_JOBS": ("behaviour", "Debug jobs kept",
+                  "In/out PDF pairs retained below. 0 = off."),
+}
+
+HELP_ADV = {
+    "EDGE_STRIP_FRAC": "How close to the top/bottom edge counts as an edge strip.",
+    "EDGE_BAND_FRAC": "Edge strips thinner than this are dropped. Raise if a "
+                      "browser header is being kept, lower if a real label edge "
+                      "is being eaten.",
+    "SPECK_AREA_FRAC": "Ink blobs smaller than this fraction of the page are noise.",
+    "LINE_MIN_FRAC": "Shortest run that counts as a border line. Lower if a label "
+                     "border is being missed.",
+    "LINE_MAX_FRAC": "Longest run that counts. Lower if a page frame is being "
+                     "treated as the label.",
+    "SKIP_CROP_AREA": "Detected region bigger than this means the page IS the "
+                      "content, so no crop.",
+    "BLANK_CELL_FRAC": "Below this much ink, a page is blank and gets skipped.",
+    "DARK": "Grey level counting as a border line, 0-255.",
+    "GRID_INK": "Averaged grey counting as inked content, 0-255.",
+    "DETECT_PX": "Line-detection raster size. Cost knob only.",
+    "GRID_CELLS": "Content grid size. Cost knob only.",
+    "LINE_MIN_COUNT": "Border lines needed in each axis.",
+    "LINE_TOL_FRAC": "How far a line may fall short and still corroborate a box.",
+    "TARGET_QUEUE": "Fallback CUPS queue. Normally comes from the device URI.",
+    "KEEP_DIR": "Where in/out PDF pairs are kept.",
+}
+
+# Sanity ranges. Anything numeric not listed just has to parse as a number.
+RANGES = {
+    "LABEL_W_MM": (10, 300), "LABEL_H_MM": (10, 2000),
+    "MARGIN_L_MM": (0, 50), "MARGIN_R_MM": (0, 50),
+    "MARGIN_T_MM": (0, 50), "MARGIN_B_MM": (0, 50),
+    "PAD_MM": (0, 50), "CROP_PAD_MM": (0, 50),
+    "MAX_PAGES": (1, 50), "KEEP_JOBS": (0, 100),
+    "UPSCALE": (0, 1), "UPSCALE_MAX": (0, 20), "ROTATE_GAIN": (0, 2),
+    "DARK": (1, 254), "GRID_INK": (1, 255),
+    "DETECT_PX": (200, 4000), "GRID_CELLS": (16, 600),
+    "LINE_MIN_COUNT": (1, 20),
+    "EDGE_STRIP_FRAC": (0, 0.5), "EDGE_BAND_FRAC": (0, 0.5),
+    "SPECK_AREA_FRAC": (0, 0.5), "LINE_MIN_FRAC": (0.01, 1),
+    "LINE_MAX_FRAC": (0.01, 1), "SKIP_CROP_AREA": (0.1, 1),
+    "BLANK_CELL_FRAC": (0, 0.5), "LINE_TOL_FRAC": (0, 0.5),
+}
+INTS = {"MAX_PAGES", "KEEP_JOBS", "DETECT_PX", "GRID_CELLS", "LINE_MIN_COUNT",
+        "DARK", "GRID_INK", "UPSCALE"}
+TEXT = {"MEDIA", "TARGET_QUEUE", "KEEP_DIR", "FINISHINGS"}
+
+FINISHING_LABELS = {
+    "3": "No cut", "11": "Cut (printer decides)",
+    "60": "Cut after every label", "63": "One cut at end of job",
+}
+
+
+# ------------------------------------------------------------------ printer ----
+
+_cache = {"t": 0, "v": {}}
+
+
+def printer_info(cfg):
+    """Live printer facts, cached briefly so a page refresh is not an IPP storm."""
+    if time.time() - _cache["t"] < 20:
+        return _cache["v"]
+    info = {"state": None, "media_ready": None, "finishings": [], "media": [],
+            "uri": None, "model": None}
+    try:
+        uri = subprocess.run(["lpstat", "-v", cfg["TARGET_QUEUE"]],
+                             capture_output=True, text=True, timeout=5).stdout
+        m = re.search(r"ipp://([^/\s]+)", uri)
+        if m:
+            info["uri"] = m.group(1)
+            r = subprocess.run(
+                ["ipptool", "-tv", f"ipp://{m.group(1)}/ipp/print",
+                 "get-printer-attributes.test"],
+                capture_output=True, text=True, timeout=8).stdout
+            def grab(name):
+                mm = re.search(rf"{name} \([^)]*\) = (.+)", r)
+                return mm.group(1).strip() if mm else None
+            info["state"] = grab("printer-state")
+            info["model"] = grab("printer-make-and-model")
+            info["media_ready"] = grab("media-ready")
+            fs = grab("finishings-supported") or ""
+            name2enum = {"none": "3", "trim": "11",
+                         "trim-after-pages": "60", "trim-after-job": "63"}
+            info["finishings"] = [name2enum[x] for x in fs.split(",")
+                                  if x.strip() in name2enum]
+            ms = grab("media-supported") or ""
+            info["media"] = [x.strip() for x in ms.split(",") if x.strip()][:40]
+    except Exception:
+        pass
+    _cache.update(t=time.time(), v=info)
+    return info
+
+
+def queue_states():
+    try:
+        out = subprocess.run(["lpstat", "-p"], capture_output=True, text=True,
+                             timeout=5).stdout
+        return [l.strip() for l in out.splitlines() if l.startswith("printer")]
+    except Exception:
+        return []
+
+
+# ------------------------------------------------------------------- config ----
+
+
+def write_config(values, path=CONF, backup_dir=None):
+    """Update KEY=VALUE lines in place, preserving comments and order.
+
+    The config file carries a lot of explanation. Rewriting it from a dict would
+    throw all of that away, so each line is edited where it stands and unknown
+    keys are appended at the end.
+
+    Written in place rather than via a temp file and rename, because this runs as
+    `lp` and /etc is 0755 root:root: we can write the file (0664 root:lp) but
+    cannot create a sibling in that directory. For the same reason the backup
+    goes to backup_dir, which lp owns. The payload is a few KB written in one
+    call, and labelcrop falls back to DEFAULTS on anything it cannot parse, so
+    losing atomicity here is not a real exposure.
+    """
+    try:
+        with open(path) as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        lines = []
+
+    seen, out = set(), []
+    for line in lines:
+        m = re.match(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$", line)
+        if m and m.group(2) in values:
+            k = m.group(2)
+            seen.add(k)
+            out.append(f"{m.group(1)}{k}={values[k]}\n")
+        else:
+            out.append(line)
+    extra = [k for k in values if k not in seen]
+    if extra:
+        if out and not out[-1].endswith("\n"):
+            out.append("\n")
+        out.append("\n# Added by labelui\n")
+        out += [f"{k}={values[k]}\n" for k in extra]
+    data = "".join(out)
+
+    if backup_dir and os.path.isdir(backup_dir) and lines:
+        try:
+            with open(os.path.join(backup_dir, "labelproxy.conf.bak"), "w") as fh:
+                fh.writelines(lines)
+        except OSError as e:
+            # A failed backup must not block the save; say so and carry on.
+            print(f"labelui: could not write backup: {e}", file=sys.stderr)
+
+    with open(path, "w") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def validate(form, info):
+    """Returns (clean_values, {key: error}). Nothing is written unless clean."""
+    values, errors = {}, {}
+    allowed_fin = info.get("finishings") or list(FINISHING_LABELS)
+    for key in labelcrop.DEFAULTS:
+        if key not in form:
+            continue
+        raw = form[key].strip()
+        if key == "FINISHINGS":
+            if raw not in allowed_fin:
+                errors[key] = f"printer does not support finishings={raw}"
+            else:
+                values[key] = raw
+            continue
+        if key in TEXT:
+            if not raw:
+                errors[key] = "cannot be empty"
+            elif len(raw) > 200 or "\n" in raw:
+                errors[key] = "too long"
+            else:
+                values[key] = raw
+            continue
+        try:
+            v = float(raw)
+        except ValueError:
+            errors[key] = "must be a number"
+            continue
+        lo, hi = RANGES.get(key, (-1e9, 1e9))
+        if not (lo <= v <= hi):
+            errors[key] = f"must be between {lo} and {hi}"
+            continue
+        if key in INTS:
+            if v != int(v):
+                errors[key] = "must be a whole number"
+                continue
+            values[key] = str(int(v))
+        else:
+            values[key] = ("%g" % v)
+    return values, errors
+
+
+# ------------------------------------------------------------------ previews ----
+
+
+def jobs(cfg):
+    """Kept in/out pairs, newest first, as [(stamp, has_in, has_out)]."""
+    d = cfg.get("KEEP_DIR") or ""
+    if not d or not os.path.isdir(d):
+        return []
+    stamps = {}
+    for fn in os.listdir(d):
+        m = re.match(r"^(\d{8}-\d{6}-\S+?)-(in|out)\.pdf$", fn)
+        if m:
+            stamps.setdefault(m.group(1), set()).add(m.group(2))
+    return [(s, "in" in k, "out" in k)
+            for s, k in sorted(stamps.items(), reverse=True)]
+
+
+def render_png(pdf_path, boxes=None, max_px=360, page=0):
+    """One page of a PDF as PNG bytes, optionally with a red detection box."""
+    doc = labelcrop.open_input(pdf_path, labelcrop.DEFAULTS)
+    try:
+        if page >= doc.page_count:
+            return None
+        src = doc[page]
+        shot = fitz.open()
+        q = shot.new_page(width=src.rect.width, height=src.rect.height)
+        try:
+            q.show_pdf_page(q.rect, doc, page)
+        except ValueError:
+            pass  # genuinely empty page; leave it white
+        if boxes:
+            for b in boxes:
+                q.draw_rect(fitz.Rect(*b), color=(0.85, 0, 0),
+                            width=max(1.5, src.rect.height / 250))
+        s = max_px / max(src.rect.width, src.rect.height)
+        png = shot[0].get_pixmap(matrix=fitz.Matrix(s, s), alpha=False).tobytes("png")
+        shot.close()
+        return png
+    finally:
+        doc.close()
+
+
+def recrop(stamp, cfg):
+    """Re-run detection on a kept job with current settings. Prints nothing."""
+    src = os.path.join(cfg["KEEP_DIR"], f"{stamp}-in.pdf")
+    if not os.path.exists(src):
+        return None, "input PDF no longer kept"
+    work = tempfile.mkdtemp(prefix="labelui-")
+    try:
+        out = os.path.join(work, "out.pdf")
+        previews = []
+        n = labelcrop.build(src, out, cfg, previews=previews)
+        boxes = [p["clip"] for p in previews if p.get("clip")]
+        pages = []
+        doc = fitz.open(out)
+        try:
+            for i in range(doc.page_count):
+                s = 360 / max(doc[i].rect.width, doc[i].rect.height)
+                pages.append(doc[i].get_pixmap(
+                    matrix=fitz.Matrix(s, s), alpha=False).tobytes("png"))
+        finally:
+            doc.close()
+        return {"n": n, "previews": previews, "boxes": boxes, "pages": pages}, None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------- html ----
+
+CSS = """
+:root{--bg:#f6f7f9;--fg:#1c2024;--mut:#667;--line:#dfe3e8;--card:#fff;
+--accent:#2f6fd0;--warn:#b35b00;--bad:#c0392b;--ok:#1e7b47}
+@media(prefers-color-scheme:dark){:root{--bg:#15181c;--fg:#e6e9ed;--mut:#98a2ad;
+--line:#2a2f36;--card:#1d2127;--accent:#6ea8f0;--warn:#e0a060;--bad:#ef6b5c;--ok:#5bc98a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,
+BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:900px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:20px;margin:0 0 2px}
+.sub{color:var(--mut);font-size:13px;margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:16px;margin-bottom:16px}
+h2{font-size:15px;margin:0 0 12px;letter-spacing:.01em}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+label{display:block;font-size:13px;font-weight:600;margin-bottom:4px}
+.hint{font-size:12px;color:var(--mut);margin-top:3px;line-height:1.4}
+input,select{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:6px;
+background:var(--bg);color:var(--fg);font:inherit;font-size:14px}
+input:focus,select:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.err input,.err select{border-color:var(--bad)}
+.errmsg{color:var(--bad);font-size:12px;margin-top:3px}
+button{background:var(--accent);color:#fff;border:0;border-radius:6px;
+padding:9px 16px;font:inherit;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line)}
+.bar{position:sticky;bottom:0;z-index:2;background:var(--card);
+border-top:1px solid var(--line);border-radius:0 0 10px 10px;
+margin:0 0 16px;padding:14px 16px;display:flex;gap:12px;align-items:center;
+flex-wrap:wrap}
+/* The bar used to carry margin-bottom:-64px to cancel the body padding. That
+   made it overlap the card below it and swallow the "Recent jobs" heading. */
+.flash{padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:14px}
+.flash.ok{background:color-mix(in srgb,var(--ok) 15%,transparent);color:var(--ok)}
+.flash.bad{background:color-mix(in srgb,var(--bad) 15%,transparent);color:var(--bad)}
+.flash.warn{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td{padding:4px 0;vertical-align:top}
+td:first-child{color:var(--mut);width:140px}
+details{margin-top:4px}
+summary{cursor:pointer;font-size:14px;font-weight:600;padding:8px 0}
+.job{display:flex;gap:14px;align-items:flex-start;padding:14px 0;
+border-top:1px solid var(--line);flex-wrap:wrap}
+.job:first-of-type{border-top:0}
+.job img{border:1px solid var(--line);border-radius:4px;background:#fff;
+max-height:170px;width:auto}
+.jmeta{flex:1;min-width:150px}
+.stamp{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;
+background:var(--bg);border:1px solid var(--line);color:var(--mut);margin-right:4px}
+.pair{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap}
+.cap{font-size:11px;color:var(--mut);text-align:center;margin-top:3px}
+"""
+
+
+def esc(x):
+    return html.escape(str(x), quote=True)
+
+
+def field_html(key, val, info, errors):
+    group, label, hint = FIELDS.get(key, ("adv", key, HELP_ADV.get(key, "")))
+    err = errors.get(key)
+    cls = ' class="err"' if err else ""
+    if key == "FINISHINGS":
+        opts = info.get("finishings") or list(FINISHING_LABELS)
+        body = f'<select name="{key}">' + "".join(
+            f'<option value="{esc(o)}"{" selected" if str(val)==o else ""}>'
+            f'{esc(FINISHING_LABELS.get(o, o))}</option>' for o in opts) + "</select>"
+    elif key == "MEDIA" and info.get("media"):
+        opts = info["media"]
+        if val not in opts:
+            opts = [val] + opts
+        body = f'<select name="{key}">' + "".join(
+            f'<option value="{esc(o)}"{" selected" if str(val)==o else ""}>'
+            f'{esc(o)}</option>' for o in opts) + "</select>"
+    else:
+        body = f'<input name="{key}" value="{esc(val)}">'
+    out = [f'<div{cls}><label for="{key}">{esc(label)}</label>', body]
+    if err:
+        out.append(f'<div class="errmsg">{esc(err)}</div>')
+    if hint:
+        out.append(f'<div class="hint">{esc(hint)}</div>')
+    out.append("</div>")
+    return "".join(out)
+
+
+def page(cfg, info, flash=None, errors=None, recrop_result=None, recrop_job=None):
+    errors = errors or {}
+    q = queue_states()
+    media_mismatch = (info.get("media_ready") and cfg.get("MEDIA")
+                      and info["media_ready"] != cfg["MEDIA"])
+
+    h = [f'<!doctype html><html lang="en"><head><meta charset="utf-8">',
+         '<meta name="viewport" content="width=device-width,initial-scale=1">',
+         '<title>Label Printer settings</title>',
+         f'<style>{CSS}</style></head><body><div class="wrap">',
+         '<h1>Label Printer (auto-crop)</h1>',
+         '<p class="sub">Settings apply to the next job. Nothing here prints.</p>']
+
+    if flash:
+        kind, msg = flash
+        h.append(f'<div class="flash {kind}">{esc(msg)}</div>')
+    if media_mismatch:
+        h.append(
+            f'<div class="flash warn">The printer currently has '
+            f'<b>{esc(info["media_ready"])}</b> loaded, but this is set to '
+            f'<b>{esc(cfg["MEDIA"])}</b>. Labels will come out the wrong size.</div>')
+
+    # ---- status
+    h.append('<div class="card"><h2>Status</h2><table>')
+    h.append(f'<tr><td>Printer</td><td>{esc(info.get("model") or "unknown")}'
+             f' &middot; {esc(info.get("uri") or "?")}</td></tr>')
+    h.append(f'<tr><td>State</td><td>{esc(info.get("state") or "unreachable")}</td></tr>')
+    h.append(f'<tr><td>Roll loaded</td><td>{esc(info.get("media_ready") or "?")}</td></tr>')
+    for line in q:
+        h.append(f'<tr><td>Queue</td><td>{esc(line)}</td></tr>')
+    h.append("</table></div>")
+
+    # ---- settings
+    h.append('<form method="post" action="/save">')
+    for gid, title in (("roll", "Roll and cutter"), ("behaviour", "Behaviour")):
+        keys = [k for k in labelcrop.DEFAULTS
+                if FIELDS.get(k, ("adv",))[0] == gid]
+        h.append(f'<div class="card"><h2>{title}</h2><div class="grid">')
+        h += [field_html(k, cfg.get(k, ""), info, errors) for k in keys]
+        h.append("</div></div>")
+
+    adv = [k for k in labelcrop.DEFAULTS if k not in FIELDS]
+    h.append('<div class="card"><details><summary>Advanced &mdash; detection tuning'
+             '</summary><p class="hint">Only worth touching if something is being '
+             'cropped wrongly. Use <b>Re-crop</b> on a job below to check a change '
+             'before printing.</p><div class="grid">')
+    h += [field_html(k, cfg.get(k, ""), info, errors) for k in adv]
+    h.append("</div></details></div>")
+    h.append('<div class="bar"><button type="submit">Save settings</button>'
+             '<span class="hint">No restart needed &mdash; the backend rereads '
+             'the file on every job.</span></div></form>')
+
+    # ---- recrop result
+    if recrop_result:
+        h.append(f'<div class="card"><h2>Re-crop of {esc(recrop_job)} '
+                 'with current settings</h2><div class="pair">')
+        for i, png in enumerate(recrop_result["pages"]):
+            import base64
+            b = base64.b64encode(png).decode()
+            h.append(f'<div><img src="data:image/png;base64,{b}" alt="label {i+1}">'
+                     f'<div class="cap">label {i+1}</div></div>')
+        h.append("</div><p class=hint>")
+        for p in recrop_result["previews"]:
+            if p["reason"] == "blank":
+                h.append(f'<span class="tag">page {p["page"]+1}: blank, skipped</span>')
+            else:
+                h.append(f'<span class="tag">page {p["page"]+1}: {esc(p["reason"])}, '
+                         f'rotate {p["rotate"]}, scale {p["scale"]:.2f}</span>')
+        h.append("</p><p class=hint>Nothing was printed.</p></div>")
+
+    # ---- jobs
+    js = jobs(cfg)
+    h.append('<div class="card"><h2>Recent jobs</h2>')
+    if not js:
+        h.append('<p class="hint">Nothing kept yet. Print something, or check '
+                 'KEEP_JOBS is above zero.</p>')
+    for stamp, has_in, has_out in js:
+        h.append('<div class="job"><div class="pair">')
+        if has_in:
+            h.append(f'<div><img src="/thumb?job={urllib.parse.quote(stamp)}'
+                     f'&which=in" alt="input" loading="lazy">'
+                     '<div class="cap">in</div></div>')
+        if has_out:
+            h.append(f'<div><img src="/thumb?job={urllib.parse.quote(stamp)}'
+                     f'&which=out" alt="output" loading="lazy">'
+                     '<div class="cap">printed</div></div>')
+        h.append(f'</div><div class="jmeta"><div class="stamp">{esc(stamp)}</div>'
+                 f'<form method="post" action="/recrop" style="margin-top:8px">'
+                 f'<input type="hidden" name="job" value="{esc(stamp)}">'
+                 f'<button class="ghost" type="submit">Re-crop with current settings'
+                 f'</button></form></div></div>')
+    h.append("</div></div></body></html>")
+    return "".join(h)
+
+
+# -------------------------------------------------------------------- server ----
+
+
+def parse_allow(spec):
+    nets = []
+    for part in spec.split(","):
+        part = part.strip()
+        if part:
+            try:
+                nets.append(ipaddress.ip_network(part, strict=False))
+            except ValueError:
+                print(f"labelui: ignoring bad CIDR {part!r}", file=sys.stderr)
+    return nets
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "labelui"
+    allow_nets = []
+
+    def log_message(self, fmt, *a):
+        sys.stderr.write("labelui: %s %s\n" % (self.client_address[0], fmt % a))
+
+    def permitted(self):
+        try:
+            ip = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        return any(ip in n for n in self.allow_nets)
+
+    def guard(self):
+        if self.permitted():
+            return True
+        self.log_message("DENIED (not in LABELUI_ALLOW)")
+        self.send_error(403, "Not permitted from this address")
+        return False
+
+    def reply(self, body, ctype="text/html; charset=utf-8", code=200):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def form(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n).decode("utf-8", "replace")
+        return {k: v[0] for k, v in urllib.parse.parse_qs(raw).items()}
+
+    def do_GET(self):
+        if not self.guard():
+            return
+        u = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(u.query)
+        cfg = labelcrop.load_config(CONF)
+
+        if u.path == "/thumb":
+            stamp = (qs.get("job") or [""])[0]
+            which = (qs.get("which") or ["in"])[0]
+            if which not in ("in", "out") or not re.match(r"^[\w.-]+$", stamp):
+                return self.send_error(400, "bad request")
+            path = os.path.join(cfg["KEEP_DIR"], f"{stamp}-{which}.pdf")
+            if not os.path.exists(path):
+                return self.send_error(404, "not kept")
+            try:
+                png = render_png(path)
+            except Exception as e:
+                return self.send_error(500, f"render failed: {e}")
+            if png is None:
+                return self.send_error(404, "no pages")
+            return self.reply(png, "image/png")
+
+        if u.path in ("/", "/index.html"):
+            flash = None
+            if qs.get("saved"):
+                flash = ("ok", "Settings saved. They apply to the next job.")
+            return self.reply(page(cfg, printer_info(cfg), flash=flash))
+        self.send_error(404, "not found")
+
+    def do_POST(self):
+        if not self.guard():
+            return
+        u = urllib.parse.urlparse(self.path)
+        cfg = labelcrop.load_config(CONF)
+        info = printer_info(cfg)
+
+        if u.path == "/recrop":
+            stamp = self.form().get("job", "")
+            if not re.match(r"^[\w.-]+$", stamp):
+                return self.send_error(400, "bad job")
+            res, err = recrop(stamp, cfg)
+            flash = ("bad", f"Re-crop failed: {err}") if err else None
+            return self.reply(page(cfg, info, flash=flash,
+                                   recrop_result=res, recrop_job=stamp))
+
+        if u.path == "/save":
+            values, errors = validate(self.form(), info)
+            if errors:
+                merged = dict(cfg)
+                merged.update(values)
+                return self.reply(page(
+                    merged, info,
+                    flash=("bad", f"{len(errors)} setting(s) rejected. "
+                                  "Nothing was saved."), errors=errors))
+            try:
+                write_config(values, CONF, cfg.get("KEEP_DIR"))
+            except Exception as e:
+                return self.reply(page(cfg, info, flash=(
+                    "bad", f"Could not write {CONF}: {e}")))
+            self.send_response(303)
+            self.send_header("Location", "/?saved=1")
+            self.end_headers()
+            return
+        self.send_error(404, "not found")
+
+
+def main(argv):
+    global PORT, ALLOW, CONF
+    port, allow, conf = PORT, ALLOW, CONF
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--port":
+            i += 1; port = int(argv[i])
+        elif a == "--allow":
+            i += 1; allow = argv[i]
+        elif a == "--conf":
+            i += 1; conf = argv[i]
+        elif a == "--backend":
+            i += 1  # already loaded at import; accepted for symmetry
+        else:
+            print(__doc__); return 2
+        i += 1
+    CONF = conf
+    Handler.allow_nets = parse_allow(allow)
+    if not Handler.allow_nets:
+        print("labelui: refusing to start with an empty allowlist", file=sys.stderr)
+        return 1
+    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    print(f"labelui: listening on :{port}, allowing "
+          f"{', '.join(str(n) for n in Handler.allow_nets)}", file=sys.stderr)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

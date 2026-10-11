@@ -1,0 +1,44 @@
+# Settings page for the label proxy.
+# Installed to /etc/systemd/system/labelui.service.
+#
+# Named .systemd in the source folder because labelproxy.service in the same
+# folder is the AVAHI record (XML), not a systemd unit. Two files ending
+# .service meaning different things is a trap worth avoiding.
+[Unit]
+Description=Label proxy settings page
+Documentation=file:/opt/labelproxy/README.md
+After=network-online.target cups.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/labelui
+ExecStart=/usr/local/bin/labelui
+Restart=on-failure
+RestartSec=5
+
+# Runs as lp, which already owns /var/lib/labelproxy. Never root: this process
+# parses network input, and its only legitimate write is one config file.
+User=lp
+Group=lp
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+# write targets: the config it edits (plus the .bak and temp file beside it)
+# Just the one config file. /etc itself stays read-only: the write is
+# in-place on the file, and the backup goes to /var/lib/labelproxy.
+ReadWritePaths=/etc/labelproxy.conf /var/lib/labelproxy
+
+[Install]
+WantedBy=multi-user.target

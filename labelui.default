@@ -1,0 +1,17 @@
+# /etc/default/labelui - read by labelui.service at start.
+# Changing anything here needs: systemctl restart labelui
+
+# Port for the settings page. Deliberately NOT advertised over mDNS: every extra
+# Bonjour record costs capacity in a cross-VLAN mDNS reflector, and overrunning
+# one can evict OTHER devices' records. See "mDNS" in the README. Reach it by IP.
+LABELUI_PORT=8080
+
+# Who may reach it, comma-separated CIDRs. Set this to the networks your own
+# clients are on, and leave out the network the printers live on if that is an
+# untrusted IoT segment - otherwise every smart plug and TV sharing that VLAN
+# can reconfigure your printer. 127.0.0.1/32 keeps local curl working.
+LABELUI_ALLOW=192.168.0.0/16,127.0.0.1/32
+
+# Paths. Rarely need changing.
+#LABELPROXY_CONF=/etc/labelproxy.conf
+#LABELUI_BACKEND=/usr/lib/cups/backend/labelcrop

@@ -1,0 +1,99 @@
+*PPD-Adobe: "4.3"
+*% Label Proxy: an AirPrint queue that accepts anything and hands a cropped,
+*% label-sized PDF to the labelcrop backend.
+*%
+*% The two keywords that make iOS treat this as an AirPrint printer are
+*% cupsUrfSupported (becomes URF= in the Bonjour TXT record, without which iOS
+*% ignores the queue entirely) and the cupsFilter2 line (becomes pdl=). Values
+*% mirror what the QL-1110NWB itself advertises, since that is what ultimately
+*% prints: 300dpi, 8-bit greyscale, one copy per pass.
+*FormatVersion: "4.3"
+*FileVersion: "2.0"
+*LanguageVersion: English
+*LanguageEncoding: ISOLatin1
+*PCFileName: "LBLPROXY.PPD"
+*Manufacturer: "Brother"
+*Product: "(Brother QL-1110NWB)"
+*ModelName: "Brother QL-1110NWB"
+*ShortNickName: "Brother QL-1110NWB"
+*NickName: "Brother QL-1110NWB"
+*PSVersion: "(3010.000) 0"
+*LanguageLevel: "3"
+*ColorDevice: False
+*DefaultColorSpace: Gray
+*FileSystem: False
+*Throughput: "1"
+*LandscapeOrientation: Plus90
+*TTRasterizer: Type42
+*cupsVersion: 2.4
+*cupsModelNumber: 0
+*cupsManualCopies: False
+
+*% Accept anything CUPS can turn into PDF: application/pdf, image/jpeg,
+*% image/png, image/urf, text/plain. The backend gets PDF in every case.
+*cupsFilter2: "application/vnd.cups-pdf application/pdf 0 -"
+
+*% AirPrint advertisement. V1.4 = URF version, W8 = 8-bit greyscale,
+*% CP1 = one copy per pass, RS300 = 300dpi, IS1 = main input slot,
+*% MT1-5 = media types, OB10 = output bin, PQ4 = normal quality,
+*% DM1 = one-sided only.
+*cupsUrfSupported: "V1.4,W8,CP1,IS1,MT1-5,OB10,PQ4,RS300,DM1"
+*APSupplies: "source=none"
+
+*% NOTE: there is deliberately no *APPrinterIconPath here. It is a macOS-CUPS
+*% keyword and Debian's cupsd ignores it entirely - the binary contains no
+*% reference to it, nor any per-printer icon handling. The icon is installed as
+*% doc-root/images/generic.png instead; see setup.sh and the README.
+*cupsSNMPSupplies: False
+
+*% Identity is copied verbatim from the real QL-1110NWB so macOS/iOS draw the
+*% label-printer icon rather than the generic laser one. ty= comes from NickName
+*% and product= from Product, and those are the keys the OS matches on; usb_MFG/
+*% usb_MDL cannot be reproduced here because stock CUPS only emits them for
+*% usb:// device URIs, not network queues.
+*%
+*% This does NOT rename what you see: the queue's display name comes from the
+*% Bonjour service name ("Label Printer (auto-crop) @ labelproxy") and the -D
+*% description, both of which stay distinct from the real printer.
+*%
+*% Makes macOS/iOS draw the QL-1110NWB icon instead of the generic laser one.
+*% CUPS turns this into usb_MFG= / usb_MDL= in the Bonjour TXT record, which is
+*% what the OS matches against its printer icon database. Copied from the real
+*% printer's own printer-device-id. Cosmetic only - it does not change routing,
+*% and the service name and UUID still differ from the real queue.
+*1284DeviceID: "MFG:Brother;CMD:PT-CBP,URF;MDL:QL-1110NWB;CLS:PRINTER;CID:Brother QL Type1;"
+
+*OpenUI *PageSize/Media Size: PickOne
+*OrderDependency: 10 AnySetup *PageSize
+*DefaultPageSize: Label103x164
+*PageSize Label103x164/Label 103 x 164 mm: "<</PageSize[292 465]>>setpagedevice"
+*PageSize A4/A4: "<</PageSize[595 842]>>setpagedevice"
+*PageSize Letter/US Letter: "<</PageSize[612 792]>>setpagedevice"
+*CloseUI: *PageSize
+
+*OpenUI *PageRegion/Media Size: PickOne
+*OrderDependency: 10 AnySetup *PageRegion
+*DefaultPageRegion: Label103x164
+*PageRegion Label103x164/Label 103 x 164 mm: "<</PageSize[292 465]>>setpagedevice"
+*PageRegion A4/A4: "<</PageSize[595 842]>>setpagedevice"
+*PageRegion Letter/US Letter: "<</PageSize[612 792]>>setpagedevice"
+*CloseUI: *PageRegion
+
+*% Full-bleed imageable areas. The real unprintable margins belong to the
+*% Brother and are applied by the backend when it places content, not here,
+*% so that iOS does not shrink the page a second time.
+*DefaultImageableArea: Label103x164
+*ImageableArea Label103x164/Label 103 x 164 mm: "0 0 292 465"
+*ImageableArea A4/A4: "0 0 595 842"
+*ImageableArea Letter/US Letter: "0 0 612 792"
+
+*DefaultPaperDimension: Label103x164
+*PaperDimension Label103x164/Label 103 x 164 mm: "292 465"
+*PaperDimension A4/A4: "595 842"
+*PaperDimension Letter/US Letter: "612 792"
+
+*OpenUI *Resolution/Resolution: PickOne
+*OrderDependency: 20 AnySetup *Resolution
+*DefaultResolution: 300dpi
+*Resolution 300dpi/300 dpi: "<</HWResolution[300 300]>>setpagedevice"
+*CloseUI: *Resolution

@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""
+CUPS backend: take anything (shipping label, ticket, receipt, screenshot, doc),
+work out what the interesting part of each page is, crop to it, fit it to the
+label roll, and forward to the real label-printer queue.
+
+Device URI:  labelcrop:/<target-queue>     e.g. labelcrop:/Brother_QL
+
+Config:      /etc/labelproxy.conf          simple KEY=VALUE, all optional
+Debug:       /var/lib/labelproxy/          last N in/out PDF pairs
+Logs:        /var/log/cups/error_log       (cupsctl --debug-logging for more)
+
+Importable as a module: nothing runs on import, so the offline test harness can
+call detect_page() / build() directly.
+"""
+import os
+import sys
+
+NAME = "labelcrop"
+
+# ---------------------------------------------------------------- config ----
+
+CONFIG_PATH = os.environ.get("LABELPROXY_CONF", "/etc/labelproxy.conf")
+
+DEFAULTS = {
+    # Where to send the finished label. Normally comes from DEVICE_URI; this is
+    # the fallback and what the test harness uses.
+    "TARGET_QUEUE": "Brother_QL",
+    # Media name to request on the target queue. The QL-1110NWB defaults to
+    # 29x90mm regardless of what roll is loaded, so this must be explicit.
+    "MEDIA": "om_brother-label-103x164mm_103x164mm",
+    # Cutter. IPP finishings enum, passed through to the target queue:
+    #   3  none             leave the roll uncut
+    #   11 trim             cut, printer decides when
+    #   60 trim-after-pages cut after every page, i.e. every label  <- default
+    #   63 trim-after-job   one cut at the end of the whole job
+    # Check what your printer takes with:
+    #   ipptool -tv ipp://<printer>/ipp/print get-printer-attributes.test \
+    #     | grep finishings-supported
+    # CUPS defaults this queue to 3 (none) regardless of the printer's own
+    # default, which is why labels come out uncut until this is set.
+    "FINISHINGS": "60",
+    # Roll size, mm.
+    "LABEL_W_MM": "103",
+    "LABEL_H_MM": "164",
+    # Unprintable edges, mm. The printer reports 1.54 left/right, 3.03 top/bottom
+    # (ipptool get-printer-attributes -> media-col-ready). Content placed outside
+    # these is silently clipped by the printer.
+    "MARGIN_L_MM": "1.54",
+    "MARGIN_R_MM": "1.54",
+    "MARGIN_T_MM": "3.03",
+    "MARGIN_B_MM": "3.03",
+    # Extra breathing room inside the printable area, mm. Cosmetic.
+    "PAD_MM": "1.0",
+    # Padding added around the *detected* region before cropping, mm. Stops a
+    # tight crop shaving the border line or an edge glyph.
+    "CROP_PAD_MM": "1.5",
+    # Pages. Every non-blank page becomes its own label, up to this many.
+    "MAX_PAGES": "4",
+    # Debug retention: keep this many in/out pairs in KEEP_DIR.
+    "KEEP_JOBS": "5",
+    "KEEP_DIR": "/var/lib/labelproxy",
+    # Line-detection raster: longest side in pixels. Everything downstream is
+    # expressed as a fraction of the page, so this is a cost knob only. A page
+    # can be A4 or a 1170x2532 screenshot; both scan in the same time.
+    "DETECT_PX": "1000",
+    # Content-detection grid: longest side in cells. Rendering straight to this
+    # size lets the rasteriser do the averaging, so no per-pixel Python.
+    "GRID_CELLS": "110",
+    # Ink thresholds, 0-255. DARK is for border lines (wants real black).
+    # GRID_INK is the averaged grey below which a grid cell counts as inked, so
+    # ~3% coverage of a cell. Off-white backgrounds and JPEG noise stay out.
+    "DARK": "128",
+    "GRID_INK": "248",
+    # Border detection: a run must be at least this fraction of the page
+    # dimension to count as a line...
+    "LINE_MIN_FRAC": "0.25",
+    # ...and at most this fraction, or it is a page frame / cut line, not a
+    # label border. Carrier labels sit inside the page; frames span it.
+    "LINE_MAX_FRAC": "0.90",
+    # A border box needs at least this many horizontal and vertical lines.
+    "LINE_MIN_COUNT": "2",
+    # How far a line's extent may fall short of the box edge and still count as
+    # corroborating it, as a fraction of the page's longest side.
+    "LINE_TOL_FRAC": "0.03",
+    # Drop ink components smaller than this fraction of the page area. Kills
+    # dust, stray dots, lone punctuation.
+    "SPECK_AREA_FRAC": "0.0004",
+    # Components lying wholly within this fraction of the top/bottom edge...
+    "EDGE_STRIP_FRAC": "0.06",
+    # ...are dropped if thinner than this fraction of page height. Catches
+    # browser print headers, URLs, page numbers, date stamps.
+    "EDGE_BAND_FRAC": "0.035",
+    # If the detected region covers more than this fraction of the page, the
+    # page *is* the content: skip cropping and just fit the page.
+    "SKIP_CROP_AREA": "0.85",
+    # A page with less than this fraction of inked grid cells is blank.
+    "BLANK_CELL_FRAC": "0.0008",
+    # Rotating must beat not rotating by at least this much to be worth it,
+    # otherwise a near-square label flips for a fraction of a percent.
+    "ROTATE_GAIN": "0.04",
+    # 1 = scale small content up to fill the label. 0 = only ever scale down.
+    "UPSCALE": "1",
+    # Cap on upscaling, as a multiple of natural size. 0 = uncapped.
+    "UPSCALE_MAX": "0",
+}
+
+MM = 72.0 / 25.4  # mm -> PostScript points
+
+
+def load_config(path=CONFIG_PATH):
+    """DEFAULTS overlaid with KEY=VALUE lines from path, then LABELPROXY_* env."""
+    cfg = dict(DEFAULTS)
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip().upper()
+                if k in cfg:
+                    cfg[k] = v.strip().strip('"').strip("'")
+                else:
+                    log("WARNING", f"unknown config key {k!r} in {path}, ignored")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log("WARNING", f"cannot read {path} ({e}), using defaults")
+    for k in cfg:
+        env = os.environ.get("LABELPROXY_" + k)
+        if env is not None:
+            cfg[k] = env
+    return cfg
+
+
+def num(cfg, key):
+    try:
+        return float(cfg[key])
+    except (TypeError, ValueError):
+        log("WARNING", f"{key}={cfg[key]!r} is not a number, using {DEFAULTS[key]}")
+        return float(DEFAULTS[key])
+
+
+def log(level, msg):
+    """CUPS reads the level prefix off stderr: DEBUG/INFO/WARNING/ERROR."""
+    print(f"{level}: {NAME}: {msg}", file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------- detection ----
+
+
+def _fitz():
+    try:
+        import pymupdf
+        return pymupdf
+    except ImportError:
+        import fitz
+        return fitz
+
+
+def _longest_run(line, table):
+    """Longest continuous run of ink in one row or column of pixels.
+
+    Binarises through a 256-byte translate table, then splits on the background
+    byte, so the scan happens in C rather than a Python loop. Returns
+    (length, first_index, last_index), or (0, 0, -1) if there is no ink.
+    """
+    best = pos = 0
+    best_end = -1
+    for seg in line.translate(table).split(b"\x00"):
+        n = len(seg)
+        if n > best:
+            best, best_end = n, pos + n - 1
+        pos += n + 1
+    return best, best_end - best + 1, best_end
+
+
+def find_border_box(pix, cfg):
+    """Outer extent of long continuous dark lines: a drawn label border.
+
+    Two guards keep this from firing on things that are not labels. Runs longer
+    than LINE_MAX_FRAC of the page are page frames and cut guides, so they are
+    ignored. And the resulting rectangle is only accepted if some single line
+    actually spans it in each axis, which is what distinguishes a real box from
+    four unrelated rules that happen to bound a region.
+
+    Returns a pixel box or None.
+    """
+    w, h, stride, buf = pix.width, pix.height, pix.stride, pix.samples
+    dark = int(num(cfg, "DARK"))
+    table = bytes(1 if i < dark else 0 for i in range(256))
+    lo, hi = num(cfg, "LINE_MIN_FRAC"), num(cfg, "LINE_MAX_FRAC")
+    min_count = int(num(cfg, "LINE_MIN_COUNT"))
+
+    hlines, vlines = [], []
+    for y in range(h):
+        n, a, b = _longest_run(buf[y * stride:y * stride + w], table)
+        if lo * w <= n <= hi * w:
+            hlines.append((y, a, b))
+    for x in range(w):
+        n, a, b = _longest_run(buf[x::stride], table)
+        if lo * h <= n <= hi * h:
+            vlines.append((x, a, b))
+
+    if len(hlines) < min_count or len(vlines) < min_count:
+        return None
+
+    top = min(l[0] for l in hlines)
+    bot = max(l[0] for l in hlines)
+    left = min(l[0] for l in vlines)
+    right = max(l[0] for l in vlines)
+    if right <= left or bot <= top:
+        return None
+    if (right - left) * (bot - top) < 0.02 * w * h:
+        return None
+
+    # Corroboration: a genuine rectangle has at least one horizontal line that
+    # runs the full width of it, and one vertical line that runs its full
+    # height. A header rule sitting above a label fails this, and we fall back
+    # to the content box instead of cropping from the rule downwards.
+    tol = num(cfg, "LINE_TOL_FRAC") * max(w, h)
+    if not any(a <= left + tol and b >= right - tol for _, a, b in hlines):
+        log("DEBUG", "border lines do not span the box horizontally")
+        return None
+    if not any(a <= top + tol and b >= bot - tol for _, a, b in vlines):
+        log("DEBUG", "border lines do not span the box vertically")
+        return None
+    return (left, top, right + 1, bot + 1)
+
+
+def _ink_grid(page, cfg, fitz):
+    """Coarse boolean ink grid for the page.
+
+    Rendered straight at grid resolution so the rasteriser does the averaging:
+    a cell's grey level *is* its ink coverage. That keeps this independent of
+    both page size and input resolution, and costs one small pixmap.
+    """
+    cells = max(16, int(num(cfg, "GRID_CELLS")))
+    r = page.rect
+    scale = cells / max(r.width, r.height)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
+                          colorspace=fitz.csGRAY, alpha=False)
+    gw, gh, stride, buf = pix.width, pix.height, pix.stride, pix.samples
+    ink = int(num(cfg, "GRID_INK"))
+    table = bytes(1 if i < ink else 0 for i in range(256))
+    grid = bytearray(gw * gh)
+    for gy in range(gh):
+        grid[gy * gw:(gy + 1) * gw] = buf[gy * stride:gy * stride + gw].translate(table)
+    return grid, gw, gh
+
+
+def _components(grid, gw, gh):
+    """8-connected components of the ink grid, as (x0, y0, x1, y1, cells)."""
+    seen = bytearray(gw * gh)
+    out = []
+    for start in range(gw * gh):
+        if not grid[start] or seen[start]:
+            continue
+        seen[start] = 1
+        stack = [start]
+        x0 = x1 = start % gw
+        y0 = y1 = start // gw
+        cells = 0
+        while stack:
+            i = stack.pop()
+            cells += 1
+            cx, cy = i % gw, i // gw
+            if cx < x0:
+                x0 = cx
+            if cx > x1:
+                x1 = cx
+            if cy < y0:
+                y0 = cy
+            if cy > y1:
+                y1 = cy
+            for dy in (-1, 0, 1):
+                ny = cy + dy
+                if ny < 0 or ny >= gh:
+                    continue
+                for dx in (-1, 0, 1):
+                    nx = cx + dx
+                    if nx < 0 or nx >= gw:
+                        continue
+                    j = ny * gw + nx
+                    if grid[j] and not seen[j]:
+                        seen[j] = 1
+                        stack.append(j)
+        out.append((x0, y0, x1 + 1, y1 + 1, cells))
+    return out
+
+
+def find_content_box(page, cfg, fitz):
+    """Ink bounding box in page coordinates, with specks and edge strips gone.
+
+    Returns (rect_or_None, inked_cell_fraction). The fraction is what the
+    blank-page test uses, so the caller gets both from one pass.
+    """
+    grid, gw, gh = _ink_grid(page, cfg, fitz)
+    inked = sum(grid)
+    frac = inked / float(gw * gh)
+    if not inked:
+        return None, frac
+
+    comps = _components(grid, gw, gh)
+    min_cells = max(1, int(round(num(cfg, "SPECK_AREA_FRAC") * gw * gh)))
+    edge_cells = num(cfg, "EDGE_STRIP_FRAC") * gh
+    band_cells = num(cfg, "EDGE_BAND_FRAC") * gh
+
+    keep, dropped = [], []
+    for c in comps:
+        x0, y0, x1, y1, cells = c
+        if cells < min_cells:
+            dropped.append(("speck", c))
+            continue
+        if ((y1 <= edge_cells or y0 >= gh - edge_cells)
+                and (y1 - y0) <= band_cells):
+            dropped.append(("edge-strip", c))
+            continue
+        keep.append(c)
+
+    if dropped:
+        log("DEBUG", "discarded " + ", ".join(
+            f"{why} {x1 - x0}x{y1 - y0}" for why, (x0, y0, x1, y1, _) in dropped))
+
+    if not keep:
+        # Everything looked like noise. Trust the raw ink rather than lose the page.
+        keep = comps
+
+    r = page.rect
+    cw, ch = r.width / gw, r.height / gh
+    box = fitz.Rect(
+        r.x0 + min(c[0] for c in keep) * cw,
+        r.y0 + min(c[1] for c in keep) * ch,
+        r.x0 + max(c[2] for c in keep) * cw,
+        r.y0 + max(c[3] for c in keep) * ch,
+    ) & r
+    return box, frac
+
+
+def detect_page(page, cfg):
+    """Work out what to print from one page.
+
+    Order is: drawn border box, else ink bounding box, else the whole page.
+
+    Returns (clip_rect_or_None, reason). None means "blank, skip this page".
+    reason is one of: border / content / full-page / blank.
+    """
+    fitz = _fitz()
+    r = page.rect
+    page_area = r.width * r.height or 1.0
+
+    content, frac = find_content_box(page, cfg, fitz)
+    if content is None or frac < num(cfg, "BLANK_CELL_FRAC"):
+        return None, "blank"
+
+    # Line detection wants real pixels, but bounded ones: a 1170x2532
+    # screenshot must not cost 30x an A4 page.
+    px = num(cfg, "DETECT_PX")
+    scale = px / max(r.width, r.height)
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
+                          colorspace=fitz.csGRAY, alpha=False)
+    box = find_border_box(pix, cfg)
+
+    if box is None:
+        clip, reason = content, "content"
+    else:
+        clip = fitz.Rect(*(v / scale for v in box)) & r
+        reason = "border"
+
+    if clip.get_area() > num(cfg, "SKIP_CROP_AREA") * page_area:
+        log("DEBUG", f"{reason} box covers {clip.get_area() / page_area:.0%} "
+                     "of the page, not cropping")
+        return r, "full-page"
+
+    pad = num(cfg, "CROP_PAD_MM") * MM
+    clip = (clip + (-pad, -pad, pad, pad)) & r
+    log("DEBUG", f"{reason} box {tuple(round(v, 1) for v in clip)} "
+                 f"({clip.get_area() / page_area:.0%} of page)")
+    return clip, reason
+
+
+# -------------------------------------------------------------- placement ----
+
+
+def place(clip_w, clip_h, cfg):
+    """Best fit of a clip into the printable area.
+
+    Tries both orientations and keeps whichever gives the larger scale, so a
+    landscape label lands rotated on a portrait roll. Returns (rect_tuple,
+    rotate_degrees, scale) with rect in label page coordinates.
+    """
+    page_w = num(cfg, "LABEL_W_MM") * MM
+    page_h = num(cfg, "LABEL_H_MM") * MM
+    pad = num(cfg, "PAD_MM") * MM
+    ax0 = num(cfg, "MARGIN_L_MM") * MM + pad
+    ay0 = num(cfg, "MARGIN_T_MM") * MM + pad
+    ax1 = page_w - num(cfg, "MARGIN_R_MM") * MM - pad
+    ay1 = page_h - num(cfg, "MARGIN_B_MM") * MM - pad
+    aw, ah = ax1 - ax0, ay1 - ay0
+
+    def fit(cw, ch):
+        if cw <= 0 or ch <= 0:
+            return 0.0
+        s = min(aw / cw, ah / ch)
+        if not num(cfg, "UPSCALE"):
+            s = min(s, 1.0)
+        cap = num(cfg, "UPSCALE_MAX")
+        return min(s, cap) if cap > 0 else s
+
+    s, rotate = fit(clip_w, clip_h), 0
+    s90 = fit(clip_h, clip_w)
+    # Rotating has to earn it. A near-square label would otherwise flip on a
+    # fraction of a percent, which looks like a bug on the roll.
+    if s90 > s * (1.0 + num(cfg, "ROTATE_GAIN")):
+        s, rotate = s90, 90
+
+    cw, ch = (clip_w, clip_h) if rotate == 0 else (clip_h, clip_w)
+    w, h = cw * s, ch * s
+    x0 = ax0 + (aw - w) / 2.0
+    y0 = ay0 + (ah - h) / 2.0
+    return (x0, y0, x0 + w, y0 + h), rotate, s
+
+
+# ------------------------------------------------------------------ build ----
+
+
+def open_input(path, cfg):
+    """Open path as a PDF, wrapping a bare image in a page if that is what it is.
+
+    CUPS normally converts images to PDF before the backend sees them, so this
+    is belt and braces for direct lp calls and for the test harness.
+    """
+    fitz = _fitz()
+    try:
+        doc = fitz.open(path)
+        if doc.is_pdf:
+            return doc
+        # An image document: rasterise onto a page at its native pixel size.
+        page = doc[0]
+        pix = page.get_pixmap(alpha=False)
+        doc.close()
+        out = fitz.open()
+        p = out.new_page(width=pix.width, height=pix.height)
+        p.insert_image(p.rect, pixmap=pix)
+        log("DEBUG", f"wrapped {pix.width}x{pix.height} image as a PDF page")
+        return out
+    except Exception:
+        raise
+
+
+def build(src_path, out_path, cfg, previews=None):
+    """Turn an input document into one label page per non-blank page.
+
+    previews, if given a list, collects per-page dicts for the test harness.
+    Returns the number of label pages written.
+    """
+    fitz = _fitz()
+    src = open_input(src_path, cfg)
+    out = fitz.open()
+    page_w = num(cfg, "LABEL_W_MM") * MM
+    page_h = num(cfg, "LABEL_H_MM") * MM
+    max_pages = int(num(cfg, "MAX_PAGES"))
+
+    used = 0
+    for pno in range(src.page_count):
+        if used >= max_pages:
+            log("WARNING", f"stopping at MAX_PAGES={max_pages}, "
+                           f"{src.page_count - pno} page(s) not printed")
+            break
+        page = src[pno]
+        try:
+            clip, reason = detect_page(page, cfg)
+        except Exception as e:
+            log("WARNING", f"page {pno + 1} detection failed ({e}), fitting whole page")
+            clip, reason = page.rect, "full-page"
+
+        if clip is None:
+            log("INFO", f"page {pno + 1} is blank, skipped")
+            if previews is not None:
+                previews.append({"page": pno, "reason": "blank", "clip": None})
+            continue
+
+        # show_pdf_page wants the clip in unrotated coordinates.
+        src_clip = clip * page.derotation_matrix
+        rect, rotate, scale = place(src_clip.width, src_clip.height, cfg)
+        p = out.new_page(width=page_w, height=page_h)
+        p.show_pdf_page(fitz.Rect(*rect), src, pno, clip=src_clip, rotate=rotate)
+        used += 1
+        log("INFO", f"page {pno + 1}: {reason}, rotate {rotate}, scale {scale:.2f}")
+        if previews is not None:
+            previews.append({
+                "page": pno, "reason": reason, "clip": tuple(clip),
+                "rect": rect, "rotate": rotate, "scale": scale,
+            })
+
+    if not used:
+        # Every page read as blank. Rather than drop the job, print page 1 as-is.
+        log("WARNING", "no printable pages detected, fitting page 1 unchanged")
+        page = src[0]
+        rect, rotate, _ = place(page.rect.width, page.rect.height, cfg)
+        p = out.new_page(width=page_w, height=page_h)
+        p.show_pdf_page(fitz.Rect(*rect), src, 0, rotate=rotate)
+        used = 1
+
+    out.save(out_path, garbage=3, deflate=True)
+    out.close()
+    src.close()
+    return used
+
+
+def build_passthrough(src_path, out_path, cfg):
+    """Fail-safe path: every page fitted to the label, no detection at all."""
+    fitz = _fitz()
+    src = open_input(src_path, cfg)
+    out = fitz.open()
+    page_w = num(cfg, "LABEL_W_MM") * MM
+    page_h = num(cfg, "LABEL_H_MM") * MM
+    for pno in range(min(src.page_count, int(num(cfg, "MAX_PAGES")))):
+        page = src[pno]
+        rect, rotate, _ = place(page.rect.width, page.rect.height, cfg)
+        p = out.new_page(width=page_w, height=page_h)
+        p.show_pdf_page(fitz.Rect(*rect), src, pno, rotate=rotate)
+    out.save(out_path, garbage=3, deflate=True)
+    out.close()
+    src.close()
+
+
+# ------------------------------------------------------------------ debug ----
+
+
+def keep_copy(cfg, job, in_path, out_path):
+    """Save an in/out pair under KEEP_DIR and prune to KEEP_JOBS newest."""
+    import glob
+    import shutil
+    import time
+
+    d = cfg["KEEP_DIR"]
+    keep = int(num(cfg, "KEEP_JOBS"))
+    if not d or keep <= 0:
+        return
+    try:
+        os.makedirs(d, exist_ok=True)
+        stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{job}"
+        shutil.copy(in_path, os.path.join(d, f"{stamp}-in.pdf"))
+        if out_path != in_path:
+            shutil.copy(out_path, os.path.join(d, f"{stamp}-out.pdf"))
+        stamps = sorted({os.path.basename(p).rsplit("-", 1)[0]
+                         for p in glob.glob(os.path.join(d, "*-in.pdf"))})
+        for old in stamps[:-keep]:
+            for p in glob.glob(os.path.join(d, old + "-*.pdf")):
+                os.unlink(p)
+    except OSError as e:
+        log("WARNING", f"could not keep debug copy ({e})")
+
+
+# ------------------------------------------------------- CUPS entry point ----
+
+
+def main(argv):
+    import shutil
+    import subprocess
+    import tempfile
+
+    cfg = load_config()
+    _, job, user, title, copies, opts, *rest = argv
+
+    uri = os.environ.get("DEVICE_URI", "")
+    target = uri.split(":", 1)[-1].strip("/") if ":" in uri else ""
+    target = target or cfg["TARGET_QUEUE"]
+    if not target:
+        log("ERROR", "no target queue (expected DEVICE_URI labelcrop:/<queue>)")
+        return 1
+
+    work = tempfile.mkdtemp(prefix="labelcrop-")
+    try:
+        inp = os.path.join(work, "in.pdf")
+        if rest:
+            shutil.copy(rest[0], inp)
+        else:
+            with open(inp, "wb") as fh:
+                shutil.copyfileobj(sys.stdin.buffer, fh)
+
+        outp = os.path.join(work, "out.pdf")
+        try:
+            n = build(inp, outp, cfg)
+            log("INFO", f"{n} label page(s)")
+        except Exception as e:
+            log("ERROR", f"crop failed ({e!r}), falling back to fit-only")
+            try:
+                build_passthrough(inp, outp, cfg)
+            except Exception as e2:
+                log("ERROR", f"fit-only failed too ({e2!r}), sending original")
+                outp = inp
+
+        keep_copy(cfg, job, inp, outp)
+
+        # With stdin input CUPS has already expanded copies for us.
+        cmd = ["lp", "-d", target, "-n", copies if rest else "1",
+               "-t", f"{title} [label]"]
+        if cfg["MEDIA"]:
+            cmd += ["-o", f"media={cfg['MEDIA']}"]
+        if cfg["FINISHINGS"]:
+            cmd += ["-o", f"finishings={cfg['FINISHINGS']}"]
+        cmd += ["-o", "fit-to-page", "-o", "print-quality=5", outp]
+
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            log("ERROR", f"lp failed: {r.stderr.strip() or r.stdout.strip()}")
+            return 1
+        log("INFO", r.stdout.strip() or f"queued to {target}")
+        return 0
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    # CUPS device-discovery call: no arguments.
+    if len(sys.argv) == 1:
+        print('direct labelcrop "Unknown" "Label crop proxy"')
+        sys.exit(0)
+    if len(sys.argv) not in (6, 7):
+        print("Usage: labelcrop job-id user title copies options [file]",
+              file=sys.stderr)
+        sys.exit(1)
+    sys.exit(main(sys.argv))

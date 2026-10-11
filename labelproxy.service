@@ -1,0 +1,47 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  Hand-written AirPrint advertisement for the Label_Printer_Auto CUPS queue.
+
+  CUPS advertises shared queues as "<description> @ <hostname>" and gives no
+  way to override that, and it will not emit usb_MFG/usb_MDL/kind for a network
+  queue. Publishing the record here instead gives the exact service name, makes
+  macOS treat it as a plain Bonjour printer rather than "Bonjour Shared", and
+  carries the identity keys that make the OS draw the label-printer icon.
+
+  Browsing is Off in cupsd.conf so CUPS does not also publish a duplicate.
+  Keep this to ONE service. If your printers and clients are on different VLANs,
+  every record here has to be relayed by your router's mDNS reflector, and those
+  have finite capacity - overrunning one can evict unrelated devices' records.
+-->
+<service-group>
+  <name>@@NAME@@</name>
+  <service>
+    <type>_ipp._tcp</type>
+    <subtype>_universal._sub._ipp._tcp</subtype>
+    <port>631</port>
+    <txt-record>txtvers=1</txt-record>
+    <txt-record>qtotal=1</txt-record>
+    <txt-record>rp=printers/@@QUEUE@@</txt-record>
+    <txt-record>ty=Brother QL-1110NWB</txt-record>
+    <txt-record>product=(Brother QL-1110NWB)</txt-record>
+    <txt-record>usb_MFG=Brother</txt-record>
+    <txt-record>usb_MDL=QL-1110NWB</txt-record>
+    <txt-record>usb_CMD=PT-CBP,URF</txt-record>
+    <txt-record>kind=label,roll</txt-record>
+    <txt-record>note=auto-crop proxy</txt-record>
+    <txt-record>priority=25</txt-record>
+    <txt-record>adminurl=http://@@HOST@@:631/printers/@@QUEUE@@</txt-record>
+    <txt-record>pdl=application/pdf,image/jpeg,image/png,image/urf,image/pwg-raster</txt-record>
+    <txt-record>URF=V1.4,W8,CP1,IS1,MT1-5,OB10,PQ4,RS300,DM1</txt-record>
+    <txt-record>Color=F</txt-record>
+    <txt-record>Duplex=F</txt-record>
+    <txt-record>Copies=T</txt-record>
+    <txt-record>Scan=F</txt-record>
+    <txt-record>Fax=F</txt-record>
+    <txt-record>Binary=T</txt-record>
+    <txt-record>Transparent=T</txt-record>
+    <txt-record>PaperMax=&lt;legal-A4</txt-record>
+    <txt-record>UUID=@@UUID@@</txt-record>
+  </service>
+</service-group>
