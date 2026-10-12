@@ -13,7 +13,11 @@ TARGET="${3:-Brother_QL}"
 PROXY_DESC="Label Printer (auto-crop)"
 # Bonjour service name as iOS/macOS will show it. Kept free of the " @ host"
 # suffix CUPS would otherwise append - see the Avahi section below.
-BONJOUR_NAME="${BONJOUR_NAME:-Label Printer (auto-crop)}"
+# ⚠️ Avoid parentheses. "Label Printer (auto-crop)" escapes to
+# Label\032Printer\032\040auto-crop\041 in DNS-SD, and an iPhone rendered that
+# entry with a BLANK name while plainly-named printers on the same VLAN were
+# fine. Spaces (\032) are harmless; brackets were not.
+BONJOUR_NAME="${BONJOUR_NAME:-Auto-Crop Label Printer}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 CONF=/etc/labelproxy.conf
 
