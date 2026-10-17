@@ -1,4 +1,4 @@
-# labelcrop
+# label-printer-proxy
 
 An AirPrint printer you can send **anything** to, which works out what the
 interesting part of the page is, crops to it, and prints it sensibly on a label
@@ -132,8 +132,8 @@ Debian 12 (bookworm) on anything: a VM, an LXC container, a Raspberry Pi, a spar
 box. Needs CUPS, Avahi and PyMuPDF, all from apt.
 
 ```bash
-git clone https://github.com/alexjamesbrown/labelcrop
-cd labelcrop
+git clone https://github.com/alexjamesbrown/label-printer-proxy
+cd label-printer-proxy
 sudo ./setup.sh <printer-ip> [proxy-queue-name] [target-queue-name]
 ```
 

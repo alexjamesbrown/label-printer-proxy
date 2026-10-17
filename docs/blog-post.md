@@ -247,6 +247,6 @@ label and a phone screenshot, all without feeding a single label through the
 printer. Given how many labels the manual debugging ate, that harness paid for
 itself several times over.
 
-The code is at [github.com/alexjamesbrown/labelcrop](https://github.com/alexjamesbrown/labelcrop),
+The code is at [github.com/alexjamesbrown/label-printer-proxy](https://github.com/alexjamesbrown/label-printer-proxy),
 MIT licensed. The README carries all the gotchas above in a form you can grep,
 which is really why I wrote any of this down.
