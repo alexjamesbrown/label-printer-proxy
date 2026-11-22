@@ -87,6 +87,13 @@ grep -q "^use-ipv6=" /etc/avahi/avahi-daemon.conf \
   || sed -i "/^\[server\]/a use-ipv6=no" /etc/avahi/avahi-daemon.conf
 grep -q "^allow-interfaces=" /etc/avahi/avahi-daemon.conf \
   || sed -i "/^\[server\]/a allow-interfaces=${IFACE:-eth0}" /etc/avahi/avahi-daemon.conf
+# use-ipv6=no stops Avahi *listening* on IPv6, but by default it still publishes
+# the host's IPv6 addresses as AAAA records over IPv4 mDNS. On a box with a ULA
+# or link-local address that gives clients a second address they may try first
+# and cannot reach across VLANs. Publish the IPv4 address only.
+sed -i -E "s/^#?publish-aaaa-on-ipv4=.*/publish-aaaa-on-ipv4=no/" /etc/avahi/avahi-daemon.conf
+grep -q "^publish-aaaa-on-ipv4=" /etc/avahi/avahi-daemon.conf \
+  || sed -i "/^\[publish\]/a publish-aaaa-on-ipv4=no" /etc/avahi/avahi-daemon.conf
 if [ -n "$BONJOUR_HOST" ]; then
   sed -i -E "s/^#?host-name=.*/host-name=$BONJOUR_HOST/" /etc/avahi/avahi-daemon.conf
   grep -q "^host-name=" /etc/avahi/avahi-daemon.conf \

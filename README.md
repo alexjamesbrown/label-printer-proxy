@@ -407,7 +407,18 @@ on another VLAN, twice, while both printers were completely healthy:
 Default Avahi publishes on **lo + eth0 + IPv6** across **`_ipp` and `_ipps`**:
 six registrations for one queue. Cutting it to one brought both printers straight
 back. `setup.sh` now sets `allow-interfaces` and `use-ipv6=no`, and publishes a
-single `_ipp` record.
+single `_ipp` record. It also sets `publish-aaaa-on-ipv4=no`: `use-ipv6=no`
+only stops Avahi listening on IPv6, it still advertises the host's IPv6
+addresses as AAAA records over IPv4, so the hostname resolved to a ULA address
+no client had a route to alongside the real one.
+
+> Expect `journalctl -u avahi-daemon` to repeat `Record [...] not fitting in
+> legacy unicast packet, dropping` for the TXT record, about once a minute. The
+> sender is the gateway's own discovery service, which browses with old-style
+> unicast DNS queries from an ephemeral port. Avahi has to answer those in a
+> 512-byte packet, the AirPrint TXT record does not fit, so it drops it from
+> that reply. The gateway still learns the record from normal multicast
+> traffic. Noise, not a fault.
 
 **Any new mDNS responder on a reflected VLAN spends shared budget.** Adding a Pi,
 a speaker, a print server or a home-automation box can evict something that has
