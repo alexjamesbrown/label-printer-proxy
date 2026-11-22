@@ -208,6 +208,96 @@ def case_instructions_then_label(path):
     doc.close()
 
 
+def case_instruction_page_then_sheet(path):
+    """A text-only instruction page, then a bordered sheet with the label at the bottom.
+
+    The DPD Local returns shape. Page 1 is "print this, cut out the label
+    below, drop it off": no barcode, no filled block, and it must not print.
+    Page 2 draws ONE box round everything: a grey header banner, two columns
+    of instructions and shop addresses, a dashed cut line, and the label under
+    it. The border detector is right about the box, but the label is only the
+    bottom third of it. The grey banner is as solid as a barcode, which is
+    why the split inside a border scores striped ink rather than solid ink.
+    """
+    doc = fitz.open()
+    w, h = 612, 792  # US Letter, as the real PDF was
+    p = doc.new_page(width=w, height=h)
+    _text(p, (72, 80, w - 72, 110), "Print this paper & attach the label to package",
+          fontsize=15, fontname="hebo")
+    _text(p, (72, 120, w - 72, 150), "Items to include in this package:\n"
+          "  - Men's Tree Runner - Mist (White Sole)", fontsize=8)
+    _text(p, (72, 160, w - 72, 300),
+          "Steps to successfully return your items\n\n"
+          "1. Print this paper.\n"
+          "2. Cut out the label below.\n"
+          "3. Please place shipping label directly on the shoebox and securely "
+          "tape the box closed.\n"
+          "4. Tape this label to the package.\n"
+          "5. Drop off the package at a DPD Local location", fontsize=10)
+
+    p = doc.new_page(width=w, height=h)
+    box = fitz.Rect(73, 69, 544, 695)
+    p.draw_rect(box, color=(0, 0, 0), width=1.2)
+    x0, y0, x1, y1 = box
+    # Grey header banner: solid, but not striped.
+    p.draw_rect(fitz.Rect(x0, y0, x1, y0 + 82), color=None, fill=(0.45, 0.45, 0.45))
+    _text(p, (x0 + 14, y0 + 20, x1 - 14, y0 + 80), "Return Your Parcel",
+          fontsize=24, fontname="hebo", color=(1, 1, 1))
+    # Two columns of text, divided by a vertical rule.
+    mid = x0 + (x1 - x0) * 0.6
+    p.draw_line((mid, y0 + 82), (mid, y0 + 375), color=(0, 0, 0), width=0.8)
+    _text(p, (x0 + 14, y0 + 92, mid - 10, y0 + 370),
+          "DPD Returns\n"
+          "3 simple steps to ensure your parcel is returned safely\n\n"
+          "1  Make sure all old labels are removed from the packaging\n"
+          "2  Cut out the label below and securely attach to your parcel\n"
+          "3  Choose the most convenient DPD Pickup Shop for you from the list "
+          "opposite or simply click on the link below to locate an alternative\n\n"
+          "Please make a note of your parcel tracking number (shown below) so "
+          "that you can follow your return all the way back to the sender on our "
+          "website at www.example.invalid\n\n"
+          "Your parcel tracking number is 1597 6965 2038 98F", fontsize=9)
+    shops = "Your DPD Pickup Shops:\n" + "\n".join(
+        f"Post Office {i}\n{i * 11} FARM ROAD, GU16 8TH" for i in range(1, 10))
+    _text(p, (mid + 8, y0 + 92, x1 - 10, y0 + 370), shops, fontsize=8)
+    # QR code stand-in: a solid-ish block with few edges, like the real one.
+    p.draw_rect(fitz.Rect(x0 + 14, y0 + 320, x0 + 64, y0 + 370), color=None,
+                fill=(0, 0, 0))
+    _text(p, (x0 + 72, y0 + 322, mid - 10, y0 + 370),
+          "Scan this code to find your most convenient DPD Pickup Shop.",
+          fontsize=8)
+    # Dashed cut line in light grey, as DPD prints it, over the full width.
+    y = y0 + 395
+    x = x0
+    while x < x1:
+        p.draw_line((x, y), (min(x + 7, x1), y), color=(0.6, 0.6, 0.6), width=1)
+        x += 13
+    # The label: its own top rule, barcodes left, address and logo right.
+    ly = y0 + 408
+    p.draw_line((x0, ly), (x1, ly), color=(0, 0, 0), width=1)
+    lmid = x0 + (x1 - x0) * 0.63
+    p.draw_line((lmid, ly), (lmid, y1), color=(0, 0, 0), width=0.8)
+    _barcode(p, fitz.Rect(x0 + 60, ly + 8, lmid - 60, ly + 36))
+    _text(p, (x0 + 60, ly + 38, lmid - 60, ly + 58), "ORDER UK6741109",
+          fontsize=9, align=1)
+    p.draw_line((x0, ly + 60), (lmid, ly + 60), color=(0, 0, 0), width=0.8)
+    _text(p, (x0 + 6, ly + 62, lmid - 6, ly + 86), "1597  6965 2038 98F", fontsize=13)
+    _text(p, (x0 + 10, ly + 86, lmid - 6, ly + 142), "GB-NN14 4QS", fontsize=30,
+          fontname="hebo")
+    _text(p, (x0 + 60, ly + 142, lmid - 6, ly + 162), "822-GB-NN14 4QS - NN144QS",
+          fontsize=10)
+    _barcode(p, fitz.Rect(x0 + 14, ly + 166, lmid - 14, ly + 240), seed=5)
+    _text(p, (x0 + 14, ly + 242, lmid - 14, ly + 262), "NN14 4QS1 5976 9652 0389",
+          fontsize=9, align=1)
+    _text(p, (lmid + 6, ly + 6, x1 - 6, ly + 70),
+          "DSV THRAPSTON - HP2\nHALDENS PARKWAY\nTHRAPSTON\nENGLAND\nNN14 4QS",
+          fontsize=8)
+    p.draw_rect(fitz.Rect(lmid + 30, ly + 130, x1 - 30, ly + 180), color=None,
+                fill=(0.4, 0.4, 0.4))
+    doc.save(path)
+    doc.close()
+
+
 CASES = [
     ("01-bordered-label-a4", "pdf", case_bordered_a4,
      "bordered carrier label on A4"),
@@ -223,6 +313,8 @@ CASES = [
      "PNG phone screenshot"),
     ("07-instructions-then-label", "pdf", case_instructions_then_label,
      "instructions + cut line, label below"),
+    ("08-instruction-page-then-sheet", "pdf", case_instruction_page_then_sheet,
+     "text page, then bordered sheet with cut line"),
 ]
 
 
@@ -254,9 +346,10 @@ def render_preview(src_path, out_path, previews, png_path, cfg):
         if info and info.get("clip"):
             q.draw_rect(fitz.Rect(*info["clip"]), color=(1, 0, 0),
                         width=max(1.5, page.rect.height / 300))
-        elif info and info["reason"] == "blank":
+        elif info:
             q.insert_textbox(fitz.Rect(10, 10, page.rect.width - 10, 60),
-                             "BLANK - SKIPPED", fontsize=24, color=(1, 0, 0))
+                             f"{info['reason'].upper()} - SKIPPED",
+                             fontsize=24, color=(1, 0, 0))
         in_pix.append(shot[0].get_pixmap(
             matrix=fitz.Matrix(thumb_h / page.rect.height,
                                thumb_h / page.rect.height), alpha=False))
@@ -308,8 +401,8 @@ def main():
     cfg = dict(labelcrop.DEFAULTS)
     cfg["KEEP_DIR"] = ""  # no debug copies from the harness
 
-    print(f"{'case':24} {'pages':>5}  {'result':<11} {'rot':>4} {'scale':>6}  note")
-    print("-" * 96)
+    print(f"{'case':30} {'pages':>5}  {'result':<13} {'rot':>4} {'scale':>6}  note")
+    print("-" * 104)
     failures = 0
 
     for name, ext, gen, note in CASES:
@@ -325,13 +418,14 @@ def main():
             failures += 1
             continue
 
-        printed = [p for p in previews if p["reason"] != "blank"]
-        skipped = len(previews) - len(printed)
+        printed = [p for p in previews if p.get("clip")]
+        skipped = [p["reason"] for p in previews if not p.get("clip")]
         first = printed[0] if printed else {}
         reasons = "+".join(sorted({p["reason"] for p in printed})) or "-"
-        print(f"{name:24} {n:>5}  {reasons:<11} "
+        print(f"{name:30} {n:>5}  {reasons:<13} "
               f"{first.get('rotate', 0):>4} {first.get('scale', 0):>6.2f}  {note}"
-              + (f"  [{skipped} blank skipped]" if skipped else ""))
+              + (f"  [{len(skipped)} skipped: {'+'.join(sorted(set(skipped)))}]"
+                 if skipped else ""))
 
         try:
             render_preview(src, out, previews, png, cfg)
@@ -339,7 +433,7 @@ def main():
             print(f"{'':24} preview failed: {e!r}")
             failures += 1
 
-    print("-" * 96)
+    print("-" * 104)
     print(f"previews: {outdir}/*.png")
     return 1 if failures else 0
 

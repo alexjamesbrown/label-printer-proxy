@@ -135,13 +135,43 @@ DEFAULTS = {
     "CUTLINE_NEIGHBOUR_FRAC": "0.75",
     # A rule may straddle two grid rows if it lands on a cell boundary, so the
     # spike is measured over a run of up to this many consecutive wide rows.
-    # Longer than this and it is a block of content, not a line.
-    "CUTLINE_MAX_ROWS": "3",
+    # Longer than this and it is a block of content, not a line. Four, not
+    # three: on a DPD return sheet the dashed line sits in a light grey band
+    # with the label's own top rule directly under it, and that is four rows.
+    "CUTLINE_MAX_ROWS": "4",
+    # Inside a drawn border the split is scored on STRIPED ink rather than
+    # solid ink: a solid cell whose pixels switch between ink and paper at
+    # least this many times per pixel row. A barcode cell measures 27-45 edges
+    # over 9 rows; a grey header banner, which is just as solid, measures 0-3.
+    # Without this the DPD banner made the instructions side look as solid as
+    # the label and the split was refused.
+    "STRIPE_EDGES": "1.5",
+    # Inside a drawn border a cut line must also be THIN at pixel level: no
+    # more than this fraction of the page's long side in wide pixel rows. Two
+    # lines of two-column text span the grid like a rule does, but at pixel
+    # level they are a dozen rows deep and no single row reaches across; a
+    # rule is one or two rows that do. 0.005 is 5 pixel rows at DETECT_PX.
+    "CUTLINE_MAX_THICK_FRAC": "0.005",
+    # Inside a drawn border the side cut away must hold at least this share
+    # of the ink inside the border. A page of instructions is most of the ink
+    # on a sheet (66% on the DPD return). A label's own header and address
+    # above a rule are a small share of the label's ink (around 15%), and
+    # splitting there would lose the addressee. When no cut clears this the
+    # whole border prints, which is the safe failure.
+    "BORDER_CUT_MIN_INK": "0.5",
     # If the detected region covers more than this fraction of the page, the
     # page *is* the content: skip cropping and just fit the page.
     "SKIP_CROP_AREA": "0.85",
     # A page with less than this fraction of inked grid cells is blank.
     "BLANK_CELL_FRAC": "0.0008",
+    # A page with less than this fraction of SOLID grid cells carries no label:
+    # it is an instruction page ("print this, cut out the label below, drop it
+    # off"). Such a page is skipped, but only when another page in the same
+    # job does have solid ink, so a text-only job still prints. Measured on a
+    # DPD return: the instruction page was 0.01% solid, the label sheet 10.9%.
+    # The InPost instructions *block* that motivated cut-line splitting was
+    # 2.4%, but that shared a page with its label and never reaches this test.
+    "PAGE_SOLID_MIN": "0.005",
     # Rotating must beat not rotating by at least this much to be worth it,
     # otherwise a near-square label flips for a fraction of a percent.
     "ROTATE_GAIN": "0.04",
@@ -409,41 +439,52 @@ def _solid_frac(solid, gw, y0, y1):
     return sum(solid[y0 * gw:y1 * gw]) / float((y1 - y0) * gw)
 
 
-def find_label_block(grid, solid, gw, gh, cfg):
-    """Pick the label out of a sheet that also carries instructions.
+def _striped(solid, pix, gw, gh, cfg):
+    """Solid cells that are barcode-like: many ink edges across each pixel row.
 
-    Some carriers print a page of instructions, a "cut here" line, then the real
-    label below it. The ink bounding box spans both, so the label ends up a
-    postage stamp in the middle of the roll.
-
-    This splits **only at an explicit cut rule**, never on whitespace alone, and
-    keeps the side with more solid ink: the fraction of the region dark enough
-    to be a barcode or a filled block rather than a text stroke. Plain ink
-    coverage cannot tell those apart - measured on a real InPost label it was
-    46% for the instructions against 50% for the label, while solid ink was 2.4%
-    against 18.5%.
-
-    Within the winning side, short bands of pure text are trimmed, which removes
-    a "YOU MUST ATTACH THIS LABEL" banner without ever touching a multi-line
-    address block.
-
-    Returns a grid-space (x0, y0, x1, y1) box, or None to leave the page alone.
+    Solid ink finds a barcode, but it also finds a filled banner, and a sheet
+    with a grey "Return Your Parcel" header then scores as solid as its label.
+    Counting ink/paper transitions inside each solid cell on the line-detection
+    pixmap tells the two apart: bars switch constantly, a fill never does. Only
+    solid cells are examined, so the cost is a few hundred small slices.
     """
-    rows = _row_profile(grid, gw, gh)
-    cuts = _cut_rows(rows, gw, gh, cfg)
-    if not cuts:
-        return None
+    dark = int(num(cfg, "DARK"))
+    cw, ch = pix.width / float(gw), pix.height / float(gh)
+    need = num(cfg, "STRIPE_EDGES") * ch
+    t_bin = bytes(1 if i < dark else 0 for i in range(256))
+    out = bytearray(gw * gh)
+    for i, s in enumerate(solid):
+        if not s:
+            continue
+        gx, gy = i % gw, i // gw
+        x0, x1 = int(gx * cw), int((gx + 1) * cw)
+        y0, y1 = int(gy * ch), int((gy + 1) * ch)
+        edges = 0
+        for y in range(y0, y1):
+            row = pix.samples[y * pix.stride + x0:y * pix.stride + x1].translate(t_bin)
+            edges += sum(1 for a, b in zip(row, row[1:]) if a != b)
+        out[i] = 1 if edges >= need else 0
+    return out
 
-    # Use the cut that best separates solid ink from the rest.
-    best = None
-    for c in cuts:
-        above, below = _solid_frac(solid, gw, 0, c), _solid_frac(solid, gw, c + 1, gh)
-        hi, lo = max(above, below), min(above, below)
-        ratio = hi / (lo or 1e-9)
-        if best is None or ratio > best[0]:
-            best = (ratio, c, below >= above)
-    ratio, cut, keep_below = best
+
+def _sides(solid, gw, gh, cut):
+    """(ratio, keep_below, y0, y1) for splitting at cut: the denser side kept."""
+    above, below = _solid_frac(solid, gw, 0, cut), _solid_frac(solid, gw, cut + 1, gh)
+    hi, lo = max(above, below), min(above, below)
+    keep_below = below >= above
     y0, y1 = (cut + 1, gh) if keep_below else (0, cut)
+    return hi / (lo or 1e-9), keep_below, y0, y1
+
+
+def _label_side(rows, solid, gw, gh, cut, cfg):
+    """The label side of a cut as a grid box, or None if the cut is not one.
+
+    The kept side must clear BLOCK_SOLID_MIN and beat the other side by
+    BLOCK_SOLID_RATIO. Within it, short bands of pure text are trimmed, which
+    removes a "YOU MUST ATTACH THIS LABEL" banner without ever touching a
+    multi-line address block.
+    """
+    ratio, keep_below, y0, y1 = _sides(solid, gw, gh, cut)
     kept = _solid_frac(solid, gw, y0, y1)
     log("DEBUG", f"cut line at row {cut} ({cut / gh:.0%}); keeping "
                  f"{'below' if keep_below else 'above'}, solid {kept:.1%} "
@@ -489,6 +530,33 @@ def find_label_block(grid, solid, gw, gh, cfg):
     if not xs:
         return None
     return (min(xs), ys[0], max(xs) + 1, ys[-1] + 1)
+
+
+def find_label_block(grid, solid, gw, gh, cfg):
+    """Pick the label out of a bare page that also carries instructions.
+
+    Some carriers print a page of instructions, a "cut here" line, then the real
+    label below it. The ink bounding box spans both, so the label ends up a
+    postage stamp in the middle of the roll.
+
+    This splits **only at an explicit cut rule**, never on whitespace alone, and
+    keeps the side with more solid ink: the fraction of the region dark enough
+    to be a barcode or a filled block rather than a text stroke. Plain ink
+    coverage cannot tell those apart - measured on a real InPost label it was
+    46% for the instructions against 50% for the label, while solid ink was 2.4%
+    against 18.5%.
+
+    With several cut lines, the one that best separates solid ink from the
+    rest is used.
+
+    Returns a grid-space (x0, y0, x1, y1) box, or None to leave the page alone.
+    """
+    rows = _row_profile(grid, gw, gh)
+    cuts = _cut_rows(rows, gw, gh, cfg)
+    if not cuts:
+        return None
+    cut = max(cuts, key=lambda c: _sides(solid, gw, gh, c)[0])
+    return _label_side(rows, solid, gw, gh, cut, cfg)
 
 
 def find_content_box(page, cfg, fitz):
@@ -539,30 +607,171 @@ def find_content_box(page, cfg, fitz):
     return box, frac, (grid, solid, gw, gh)
 
 
-def detect_page(page, cfg):
+def _grid_rect(box, r, gw, gh, fitz):
+    """Grid-space (x0, y0, x1, y1) box back to page coordinates."""
+    cw, ch = r.width / gw, r.height / gh
+    return fitz.Rect(r.x0 + box[0] * cw, r.y0 + box[1] * ch,
+                     r.x0 + box[2] * cw, r.y0 + box[3] * ch) & r
+
+
+def find_label_in_border(border, grid, solid, pix, gw, gh, r, cfg, fitz):
+    """Look for a cut line *inside* a drawn border and keep the label side.
+
+    Some carriers (DPD returns) draw one box round the whole sheet: the
+    instructions, a list of drop-off shops, a dashed cut line, and the label
+    below it. The border detector is right that the box is the content, but
+    printing all of it shrinks the label to 60%.
+
+    The cut-line test cannot simply be run on the page: inside a border every
+    row spans the border's width, because the border's own sides are ink at
+    both ends, so no row is a spike. It is run instead on the border's
+    interior, with the stroke cells peeled off, so spans are measured against
+    the interior width.
+
+    Inside a border the stakes are different: most bordered pages are plain
+    labels, and a label has rules of its own. So this is stricter than the
+    bare-page split in three ways, each learnt from real or synthetic input:
+
+      - a cut must be *thin* at pixel level (CUTLINE_MAX_THICK_FRAC). Two
+        rows of two-column text spanned the DPD sheet like a rule on the grid
+        and were taken for one; at pixel level no row of them reached across;
+      - sides are scored on *striped* ink, not solid ink, because the sheet's
+        grey header banner is as solid as a barcode and made the instructions
+        side look like the label;
+      - the side cut away must hold most of the ink inside the border
+        (BORDER_CUT_MIN_INK). A label's own header rule is also a wide line
+        with text above and barcodes below, and splitting there would lose
+        the carrier name or the addressee.
+
+    With several cuts passing, the one that cuts away the *least* is used:
+    if a sheet also has a rule inside its label, that is the one that keeps
+    the whole label.
+
+    If no cut passes, None: the whole border prints exactly as before.
+    """
+    cw, ch = r.width / gw, r.height / gh
+    gx0 = int((border.x0 - r.x0) / cw) + 1
+    gy0 = int((border.y0 - r.y0) / ch) + 1
+    gx1 = int((border.x1 - r.x0) / cw + 0.999) - 1
+    gy1 = int((border.y1 - r.y0) / ch + 0.999) - 1
+
+    # A stroke that lands on a cell boundary inks two cells. Peel edge rows and
+    # columns that are nearly all ink until something that is not a line shows.
+    def row_full(gy):
+        return sum(grid[gy * gw + gx0:gy * gw + gx1]) >= 0.9 * (gx1 - gx0)
+
+    def col_full(gx):
+        return sum(grid[gy * gw + gx] for gy in range(gy0, gy1)) >= 0.9 * (gy1 - gy0)
+
+    for _ in range(2):
+        if gy1 - gy0 > 4 and row_full(gy0):
+            gy0 += 1
+        if gy1 - gy0 > 4 and row_full(gy1 - 1):
+            gy1 -= 1
+        if gx1 - gx0 > 4 and col_full(gx0):
+            gx0 += 1
+        if gx1 - gx0 > 4 and col_full(gx1 - 1):
+            gx1 -= 1
+    sw, sh = gx1 - gx0, gy1 - gy0
+    if sw < 4 or sh < 4:
+        return None
+
+    sub_grid = bytearray(sw * sh)
+    for y in range(sh):
+        src = (gy0 + y) * gw + gx0
+        sub_grid[y * sw:(y + 1) * sw] = grid[src:src + sw]
+    rows = _row_profile(sub_grid, sw, sh)
+    cuts = _cut_rows(rows, sw, sh, cfg)
+
+    # Pixel geometry of the interior, for the thinness test.
+    pcw, pch = pix.width / float(gw), pix.height / float(gh)
+    px0, px1 = int(gx0 * pcw), int(gx1 * pcw)
+    dark = int(num(cfg, "DARK"))
+    t_bin = bytes(1 if i < dark else 0 for i in range(256))
+    thick_max = num(cfg, "CUTLINE_MAX_THICK_FRAC") * max(pix.width, pix.height)
+    span_min = num(cfg, "CUTLINE_SPAN_FRAC") * (px1 - px0)
+
+    def thin_rule(c):
+        """1..thick_max pixel rows reaching across the interior near row c."""
+        wide = 0
+        for py in range(int((gy0 + c - 2) * pch), int((gy0 + c + 3) * pch)):
+            if py < 0 or py >= pix.height:
+                continue
+            row = pix.samples[py * pix.stride + px0:py * pix.stride + px1].translate(t_bin)
+            if 1 not in row:
+                continue
+            first = row.index(1)
+            last = len(row) - 1 - row[::-1].index(1)
+            if last - first + 1 >= span_min:
+                wide += 1
+        return 1 <= wide <= thick_max
+
+    cuts = [c for c in cuts if thin_rule(c)]
+    if not cuts:
+        return None
+
+    striped = _striped(solid, pix, gw, gh, cfg)
+    sub_striped = bytearray(sw * sh)
+    for y in range(sh):
+        src = (gy0 + y) * gw + gx0
+        sub_striped[y * sw:(y + 1) * sw] = striped[src:src + sw]
+
+    ink_total = float(sum(rows[gy][0] for gy in range(sh)) or 1)
+    min_ink = num(cfg, "BORDER_CUT_MIN_INK")
+    passing = []
+    for c in cuts:
+        _, _, y0, y1 = _sides(sub_striped, sw, sh, c)
+        cut_away = sum(rows[gy][0] for gy in range(sh) if not y0 <= gy < y1) / ink_total
+        if cut_away < min_ink:
+            log("DEBUG", f"cut at row {c} would cut away only {cut_away:.0%} of "
+                         "the ink: a rule inside the label, not a cut line")
+            continue
+        passing.append((cut_away, c))
+    if not passing:
+        return None
+    _, cut = min(passing)
+
+    block = _label_side(rows, sub_striped, sw, sh, cut, cfg)
+    if block is None:
+        return None
+    # Give back the full interior width: the label's own left and right edges
+    # are the border, and a cut line splits a sheet top from bottom, not side
+    # from side.
+    return _grid_rect((gx0, gy0 + block[1], gx1, gy0 + block[3]), r, gw, gh, fitz)
+
+
+def detect_page(page, cfg, info=None):
     """Work out what to print from one page.
 
     Order, most specific signal first:
 
-      1. a drawn border box, which is how most carrier labels are delimited
-      2. failing that, the densest block of a page split by cut lines or
-         whitespace, which is how a label sitting under a page of instructions
-         is found
+      1. a drawn border box, which is how most carrier labels are delimited;
+         then, inside it, a cut line that splits a sheet into instructions and
+         label, in which case the label side is kept
+      2. failing a border, the densest side of a cut line on the bare page,
+         which is how a label sitting under a page of instructions is found
       3. failing that, the ink bounding box
       4. and if that covers most of the page, the page *is* the content, so no
          crop at all
 
     A drawn border always wins over a density guess: it is an explicit statement
-    about where the label is, whereas block splitting is inference.
+    about where the label is, whereas block splitting is inference. The cut
+    line inside a border is only consulted *after* the border has fixed the
+    width and the outer extent, and only ever trims top or bottom off it.
 
     Returns (clip_rect_or_None, reason). None means "blank, skip this page".
-    reason is one of: border / block / content / full-page / blank.
+    reason is one of: border / border-block / block / content / full-page /
+    blank. Whether a page is an *instruction page* is not decided here: that
+    depends on the other pages in the job, so build() does it from the solid
+    ink fraction this leaves in info["solid"] when given a dict.
     """
     fitz = _fitz()
     r = page.rect
     page_area = r.width * r.height or 1.0
 
     content, frac, (grid, solid, gw, gh) = find_content_box(page, cfg, fitz)
+    if info is not None:
+        info["solid"] = sum(solid) / float(gw * gh)
     if content is None or frac < num(cfg, "BLANK_CELL_FRAC"):
         return None, "blank"
 
@@ -576,17 +785,23 @@ def detect_page(page, cfg):
 
     if box is not None:
         clip, reason = fitz.Rect(*(v / scale for v in box)) & r, "border"
+        # Is the border round a whole sheet rather than just the label? If a
+        # cut line inside it separates a solid label from a page of text, keep
+        # the label. A bordered label's own internal rules do not qualify:
+        # neither side of them is text-only, so the solid-ratio test fails
+        # and the whole border is kept.
+        inner = find_label_in_border(clip, grid, solid, pix, gw, gh, r, cfg, fitz)
+        if inner is not None:
+            clip, reason = inner, "border-block"
     else:
         # No drawn border. Is this a multi-part page - instructions, a cut
-        # line, then the real label? Only ask here, because inside a bordered
-        # label the gaps between its own sections would split it wrongly.
+        # line, then the real label? Whitespace alone never splits (see
+        # find_label_block).
         block = find_label_block(grid, solid, gw, gh, cfg)
         if block is None:
             clip, reason = content, "content"
         else:
-            cw, ch = r.width / gw, r.height / gh
-            clip = fitz.Rect(r.x0 + block[0] * cw, r.y0 + block[1] * ch,
-                             r.x0 + block[2] * cw, r.y0 + block[3] * ch) & r
+            clip = _grid_rect(block, r, gw, gh, fitz)
             clip = clip & content if (clip & content).get_area() > 0 else clip
             reason = "block"
 
@@ -672,7 +887,12 @@ def open_input(path, cfg):
 
 
 def build(src_path, out_path, cfg, previews=None):
-    """Turn an input document into one label page per non-blank page.
+    """Turn an input document into one label page per page worth printing.
+
+    Blank pages are skipped. So are instruction pages (no solid ink at all),
+    but only when some other page in the job does carry solid ink: a job that
+    is nothing but text still prints. That decision needs the whole job, so
+    detection runs over the pages first and placement second.
 
     previews, if given a list, collects per-page dicts for the test harness.
     Returns the number of label pages written.
@@ -683,25 +903,48 @@ def build(src_path, out_path, cfg, previews=None):
     page_w = num(cfg, "LABEL_W_MM") * MM
     page_h = num(cfg, "LABEL_H_MM") * MM
     max_pages = int(num(cfg, "MAX_PAGES"))
+    solid_min = num(cfg, "PAGE_SOLID_MIN")
 
-    used = 0
+    # Pass 1: detect. Stops once MAX_PAGES pages with solid ink are in hand,
+    # since nothing after them can print: a further label is over the cap and
+    # a further instruction page would be skipped.
+    detected = []  # (pno, clip, reason, solid_frac or None)
     for pno in range(src.page_count):
-        if used >= max_pages:
-            log("WARNING", f"stopping at MAX_PAGES={max_pages}, "
-                           f"{src.page_count - pno} page(s) not printed")
-            break
         page = src[pno]
+        info = {}
         try:
-            clip, reason = detect_page(page, cfg)
+            clip, reason = detect_page(page, cfg, info)
         except Exception as e:
             log("WARNING", f"page {pno + 1} detection failed ({e}), fitting whole page")
             clip, reason = page.rect, "full-page"
+        detected.append((pno, clip, reason, info.get("solid")))
+        with_label = sum(1 for _, c, _, s in detected
+                         if c is not None and (s is None or s >= solid_min))
+        if with_label >= max_pages:
+            break
 
+    has_label = any(c is not None and s is not None and s >= solid_min
+                    for _, c, _, s in detected)
+
+    # Pass 2: place.
+    used = 0
+    for pno, clip, reason, solid_frac in detected:
+        page = src[pno]
         if clip is None:
             log("INFO", f"page {pno + 1} is blank, skipped")
             if previews is not None:
                 previews.append({"page": pno, "reason": "blank", "clip": None})
             continue
+        if has_label and solid_frac is not None and solid_frac < solid_min:
+            log("INFO", f"page {pno + 1} is an instruction page "
+                        f"({solid_frac:.2%} solid), skipped")
+            if previews is not None:
+                previews.append({"page": pno, "reason": "instructions", "clip": None})
+            continue
+        if used >= max_pages:
+            log("WARNING", f"stopping at MAX_PAGES={max_pages}, "
+                           f"{src.page_count - pno} page(s) not printed")
+            break
 
         # show_pdf_page wants the clip in unrotated coordinates.
         src_clip = clip * page.derotation_matrix
