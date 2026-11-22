@@ -91,7 +91,11 @@ user, not as yourself.
 - `labelproxy.service` is an **Avahi XML record template**, not a systemd unit.
   The systemd unit is `labelui.systemd`. A raw `<` in a TXT value silently
   invalidates the whole Avahi file. Avoid parentheses in the Bonjour name
-  (iOS rendered it blank).
+  (iOS rendered it blank), and remember that iOS keeps the first name it saw
+  for a printer in "Known Printers": a rename, UUID change or Avahi restart on
+  the server cannot fix a stale entry on a phone. See the README section "iOS
+  remembers the name a printer had the first time you used it" before
+  debugging a blank or wrong name server-side.
 - `labelproxy.ppd` is a minimal PDF-passthrough PPD carrying the AirPrint URF
   advertisement.
 - `labelproxy.conf` and `labelui.default` are installed only on first setup;

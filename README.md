@@ -365,6 +365,25 @@ duplicate. That does not affect remote IPP access, which is governed by
 > `PaperMax=<legal-A4`) silently invalidates the whole file and nothing is
 > advertised at all. Escape it as `&lt;` and check `journalctl -u avahi-daemon`.
 
+### iOS remembers the name a printer had the first time you used it
+
+The iPhone print sheet has two lists. **Other Printers** is the live Bonjour
+browse. **Known Printers** is the phone's own store of printers it has printed
+to before, shown under the *name they had at the time*, and a live record that
+matches a known printer is folded into that stored entry rather than listed
+again. Rename a printer on the network and the phone keeps showing the old
+name; the live record still finds it, so printing works.
+
+That is how this queue ended up as a nameless row with a tick next to it. The
+first version of the record was called `Label Printer (auto-crop)`, which iOS
+rendered with a blank name, and the phone saved that blank. Renaming the
+service to `Auto-Crop Label Printer` fixed the live entry, but the stored one
+kept the blank forever, and because the live record matched it the new name
+never appeared under Other Printers either. Avahi restarts, reflector
+behaviour and the record itself were all innocent. The fix is on the phone:
+swipe the blank Known Printer row to the left and remove it, then pick the
+queue from Other Printers once, and it is stored again under its real name.
+
 ### mDNS reflectors have finite capacity, and overrunning one takes OTHER devices offline
 
 If your printers and clients are on different VLANs, something is relaying mDNS

@@ -16,7 +16,9 @@ PROXY_DESC="Label Printer (auto-crop)"
 # ⚠️ Avoid parentheses. "Label Printer (auto-crop)" escapes to
 # Label\032Printer\032\040auto-crop\041 in DNS-SD, and an iPhone rendered that
 # entry with a BLANK name while plainly-named printers on the same VLAN were
-# fine. Spaces (\032) are harmless; brackets were not.
+# fine. Spaces (\032) are harmless; brackets were not. Phones that printed to
+# the old name keep the blank in "Known Printers" after a rename; see the
+# README ("iOS remembers the name a printer had the first time you used it").
 BONJOUR_NAME="${BONJOUR_NAME:-Auto-Crop Label Printer}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 CONF=/etc/labelproxy.conf
