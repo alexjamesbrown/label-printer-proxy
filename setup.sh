@@ -16,8 +16,16 @@ PROXY_DESC="Label Printer (auto-crop)"
 # ⚠️ Avoid parentheses. "Label Printer (auto-crop)" escapes to
 # Label\032Printer\032\040auto-crop\041 in DNS-SD, and an iPhone rendered that
 # entry with a BLANK name while plainly-named printers on the same VLAN were
-# fine. Spaces (\032) are harmless; brackets were not.
+# fine. Spaces (\032) are harmless; brackets were not. Phones that printed to
+# the old name keep the blank in "Known Printers" after a rename; see the
+# README ("iOS remembers the name a printer had the first time you used it").
 BONJOUR_NAME="${BONJOUR_NAME:-Auto-Crop Label Printer}"
+# Optional mDNS hostname (the "<host>.local" the service record points at).
+# Unset leaves avahi-daemon.conf alone, so a value set once by hand survives
+# re-runs. iOS keys its "Known Printers" store on this hostname plus the queue
+# path, so changing it is the only way to make a phone forget a stored entry
+# without touching the phone - see the README.
+BONJOUR_HOST="${BONJOUR_HOST:-}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 CONF=/etc/labelproxy.conf
 
@@ -79,6 +87,11 @@ grep -q "^use-ipv6=" /etc/avahi/avahi-daemon.conf \
   || sed -i "/^\[server\]/a use-ipv6=no" /etc/avahi/avahi-daemon.conf
 grep -q "^allow-interfaces=" /etc/avahi/avahi-daemon.conf \
   || sed -i "/^\[server\]/a allow-interfaces=${IFACE:-eth0}" /etc/avahi/avahi-daemon.conf
+if [ -n "$BONJOUR_HOST" ]; then
+  sed -i -E "s/^#?host-name=.*/host-name=$BONJOUR_HOST/" /etc/avahi/avahi-daemon.conf
+  grep -q "^host-name=" /etc/avahi/avahi-daemon.conf \
+    || sed -i "/^\[server\]/a host-name=$BONJOUR_HOST" /etc/avahi/avahi-daemon.conf
+fi
 
 say "cups + avahi"
 systemctl enable --now cups avahi-daemon

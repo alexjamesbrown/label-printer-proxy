@@ -38,7 +38,9 @@ Per page, in order:
    rectangle is only accepted if some single line actually *spans* it in each
    axis. That is what separates a real drawn box from four unrelated rules that
    happen to bound a region, and it is why a header rule above a label does not
-   become the label's top edge.
+   become the label's top edge. If the box turns out to enclose a whole *sheet*,
+   with a cut line separating a page of instructions from the label, the label
+   side is kept (see "A cut line inside a border" below).
 2. **The side of a cut line with more solid ink.** Failing a border, if the page
    carries an explicit "cut here" rule it is split there and the denser side
    kept. This is the "instructions at the top, cut line, real label underneath"
@@ -56,7 +58,15 @@ to fill the printable area, and centre.
 A drawn border always wins over the density guess: it is an explicit statement
 about where the label is, whereas block splitting is inference. Getting that
 order wrong makes block splitting fire *inside* a bordered label and crop to
-just its barcode.
+just its barcode. The cut-line check inside a border runs *after* the border
+has fixed the width and outer extent, under much stricter rules, and only ever
+trims the top or bottom off it.
+
+Across pages, a page with no solid ink at all (no barcode, no filled block) is
+an **instruction page** and is skipped, but only when another page in the job
+does have solid ink. The two-page DPD return ("print this paper, cut out the
+label below" and then the sheet) prints one label. A job that is nothing but
+text still prints every page.
 
 ### Finding a label under a page of instructions
 
@@ -98,6 +108,56 @@ removes a "YOU MUST ATTACH THIS LABEL" banner while leaving a multi-line address
 block alone. If nothing stands out the page is left whole, which is the safe
 outcome.
 
+### A cut line inside a border
+
+DPD Local returns draw one box round the whole sheet: a grey "Return Your
+Parcel" banner, two columns of instructions and pickup shops, a dashed cut line,
+and the label in the bottom third. The border detector is right that the box is
+the content, and the result was the whole sheet on the roll at 59%, label
+included, unreadable.
+
+An earlier version never looked for a cut line inside a border at all, because a
+label's own internal rules would be taken for one. That is still the danger, and
+most bordered pages *are* plain labels, so the split inside a border is held to
+stricter rules than on a bare page. Each came from something that went wrong:
+
+- **Spans are measured against the border's interior, not the page.** Inside a
+  border every row spans the border's width, because the border's own sides are
+  ink at both ends, so on the page grid nothing is a spike. The border strokes
+  are peeled off and the interior analysed on its own.
+- **Cut lines are found at pixel level, not on the grid.** On the grid, two
+  rows of two-column text (a sentence on the left, a shop address on the
+  right) spanned the interior exactly like a rule and were picked, while the
+  real cut (a light grey band, the dashes, and the label's own top rule
+  directly under them) filled four cells on the original PDF and five once
+  macOS had re-paginated it to A4, and was missed as "a block, not a line".
+  At pixel level the structural cut is one dark row that reaches across the
+  interior, text is five or more rows deep, and the grey band is not dark at
+  all. A candidate is a run of wide dark pixel rows no taller than
+  `CUTLINE_MAX_THICK_FRAC` of the page.
+- **Sides are scored on striped ink, not solid ink.** The grey banner is as
+  solid as a barcode on an averaged grid, and made the instructions side look
+  like the label (ratio 1.2, split refused). Counting ink edges inside each
+  solid cell on the line-detection pixmap tells them apart: a barcode cell
+  measured 27-45 edges, the banner 0-3. `STRIPE_EDGES` is the cutoff.
+- **The side cut away must hold most of the ink inside the border.** A label's
+  header rule is also a wide line with text above and barcodes below, and so
+  is a rule between an address block and a barcode. Splitting there loses the
+  carrier name or the addressee. On the DPD sheet the instructions are 66% of
+  the ink; a header and address are around 15%. `BORDER_CUT_MIN_INK` is the
+  share required. When nothing clears it, the whole border prints, which is
+  what happened before and is the safe failure.
+- **With several cuts passing, the one that cuts away the least wins.** If a
+  sheet's label has a rule of its own, that is the choice that keeps the whole
+  label.
+
+The DPD dashes themselves are light grey and vanish at the line-detection
+threshold; the structural cut that gets found is the label's own solid top rule
+directly under them. Test against what the printer actually receives, not just
+the original file: macOS re-paginates a US Letter PDF to A4 on the way through
+AirPrint, and the grid-level version of this check passed on the original and
+failed on the job.
+
 ### What the preview shows is not what prints
 
 iOS and macOS render the print preview from the **source document, on the
@@ -113,8 +173,10 @@ silently stop working on exactly the inputs you most want handled.
 Pages stay vector throughout (`show_pdf_page` with a clip). Only a bare image
 input is rasterised, and only to wrap it in a page.
 
-Multi-page input becomes one label per non-blank page, capped by `MAX_PAGES`.
-Blank pages are skipped, which is what those two-page carrier PDFs need.
+Multi-page input becomes one label per page worth printing, capped by
+`MAX_PAGES`. Blank pages are skipped, which is what those two-page carrier PDFs
+need. Instruction pages (below `PAGE_SOLID_MIN` solid ink) are skipped when
+another page in the job has a label on it.
 
 ### Fail-safe
 
@@ -188,6 +250,7 @@ work.
 | `LABEL_W_MM` / `LABEL_H_MM` | 103 / 164 | |
 | `MARGIN_*_MM` | 1.54 / 3.03 | the printer's own unprintable edges |
 | `MAX_PAGES` | 4 | stops a 30-page doc eating the roll |
+| `PAGE_SOLID_MIN` | 0.005 | below this much solid ink a page is an instruction page, skipped if another page has a label |
 | `UPSCALE` / `UPSCALE_MAX` | 1 / 0 | scale small content up to fill, uncapped |
 | `BLOCK_SOLID_RATIO` / `BLOCK_SOLID_MIN` | 2.0 / 0.05 | how clearly a block must stand out to be taken as the label |
 | `KEEP_JOBS` | 5 | in/out PDF pairs retained for debugging |
@@ -208,11 +271,11 @@ pip install pymupdf
 python3 test_crop.py /tmp/testout
 ```
 
-Generates seven representative inputs (bordered label on A4, label with browser
+Generates eight representative inputs (bordered label on A4, label with browser
 header and footer, full-page text document, two-page PDF with a blank page 2,
-landscape label, PNG screenshot, instructions-then-label), runs the real detection and placement code, and
-writes PNG previews with the detected crop boxed in red beside the output label
-pages.
+landscape label, PNG screenshot, instructions-then-label, instruction page then
+a bordered sheet), runs the real detection and placement code, and writes PNG
+previews with the detected crop boxed in red beside the output label pages.
 
 | case | expected | rotate |
 |---|---|---|
@@ -223,6 +286,7 @@ pages.
 | landscape label | border | **90** |
 | PNG screenshot | border | 0 |
 | instructions + cut line, label below | block | **90** |
+| text page, then bordered sheet with cut line | border-block, 1 skipped | **90** |
 
 Run this before deploying any detection change. It is far cheaper than feeding
 the roll. CI runs it on 3.11, 3.12 and 3.13 and uploads the previews as
@@ -301,6 +365,35 @@ duplicate. That does not affect remote IPP access, which is governed by
 > `PaperMax=<legal-A4`) silently invalidates the whole file and nothing is
 > advertised at all. Escape it as `&lt;` and check `journalctl -u avahi-daemon`.
 
+### iOS remembers the name a printer had the first time you used it
+
+The iPhone print sheet has two lists. **Other Printers** is the live Bonjour
+browse. **Known Printers** is the phone's own store of printers it has printed
+to before, shown under the *name they had at the time*, and a live record that
+matches a known printer is folded into that stored entry rather than listed
+again. Rename a printer on the network and the phone keeps showing the old
+name; the live record still finds it, so printing works.
+
+That is how this queue ended up as a nameless row with a tick next to it. The
+first version of the record was called `Label Printer (auto-crop)`, which iOS
+rendered with a blank name, and the phone saved that blank. Renaming the
+service to `Auto-Crop Label Printer` fixed the live entry, but the stored one
+kept the blank forever, and because the live record matched it the new name
+never appeared under Other Printers either. Avahi restarts, reflector
+behaviour and the record itself were all innocent.
+
+iOS offers no way to forget a known printer short of Reset Network Settings,
+and what it keys the stored entry on is the printer's **address**: the mDNS
+hostname plus the queue path. Changing the queue's UUID made the renamed
+service appear under Other Printers, but tapping it still selected the blank
+stored entry. Changing the hostname broke the link: the blank row vanished and
+the queue was stored afresh under its real name. So the fix is a new mDNS
+hostname, which `setup.sh` takes as `BONJOUR_HOST=<name>` (it writes
+`host-name=` in `avahi-daemon.conf` and leaves it alone when unset). Clients
+that address the proxy by IP, as the CUPS queues in the install notes do, are
+unaffected. The same trick works for any printer whose phone entry is stale:
+give it a new node name in its own web interface.
+
 ### mDNS reflectors have finite capacity, and overrunning one takes OTHER devices offline
 
 If your printers and clients are on different VLANs, something is relaying mDNS
@@ -355,6 +448,18 @@ lpadmin -p MyLabelPrinter -E -m everywhere \
 
 No sudo needed on macOS, and nothing in that path touches mDNS. iOS still needs
 AirPrint, so this fixes desktops rather than removing the dependency.
+
+A queue added this way is bound to that address for good, so give the proxy host
+a DHCP reservation or a static IP first. If the lease ever moves, the proxy
+queue and every desktop queue pointing at it go offline together.
+
+### Wire the printer, then switch its radio off
+
+If the printer moves from Wi-Fi to Ethernet, the Wi-Fi radio stays on unless you
+disable it in the printer's settings. A live radio can drop back into Wi-Fi
+Direct and the printer then shows up a second time, by a path that does not
+work. One printer, one network path: a lit Wi-Fi lamp on a wired printer is a
+fault waiting to happen.
 
 ### The settings page runs as `lp`, and `/etc` is `0755 root:root`
 

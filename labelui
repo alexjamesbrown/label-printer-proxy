@@ -68,6 +68,11 @@ FIELDS = {
     "MAX_PAGES": ("behaviour", "Max labels per job",
                   "Each non-blank page becomes one label. Stops a stray 30-page "
                   "document eating the roll."),
+    "PAGE_SOLID_MIN": ("behaviour", "Instruction page threshold",
+                       "A page with less than this fraction of solid ink (no "
+                       "barcode, no filled block) is an instruction page and is "
+                       "skipped, but only when another page in the job has some. "
+                       "A text-only job still prints."),
     "UPSCALE": ("behaviour", "Scale up to fill",
                 "1 = enlarge small content to fill the label. 0 = only shrink."),
     "UPSCALE_MAX": ("behaviour", "Max enlargement",
@@ -97,6 +102,15 @@ HELP_ADV = {
     "SKIP_CROP_AREA": "Detected region bigger than this means the page IS the "
                       "content, so no crop.",
     "BLANK_CELL_FRAC": "Below this much ink, a page is blank and gets skipped.",
+    "CUTLINE_MAX_THICK_FRAC": "Inside a border, a cut line may be at most this "
+                              "fraction of the page tall at pixel level. Thicker "
+                              "wide things are text.",
+    "STRIPE_EDGES": "Inside a border, a solid cell counts as barcode only with "
+                    "this many ink edges per pixel row. Tells a barcode from a "
+                    "grey banner.",
+    "BORDER_CUT_MIN_INK": "Inside a border, the side cut away must hold this "
+                          "share of the ink, or the line is a rule inside the "
+                          "label and the whole border prints.",
     "DARK": "Grey level counting as a border line, 0-255.",
     "GRID_INK": "Averaged grey counting as inked content, 0-255.",
     "DETECT_PX": "Line-detection raster size. Cost knob only.",
@@ -122,6 +136,8 @@ RANGES = {
     "SPECK_AREA_FRAC": (0, 0.5), "LINE_MIN_FRAC": (0.01, 1),
     "LINE_MAX_FRAC": (0.01, 1), "SKIP_CROP_AREA": (0.1, 1),
     "BLANK_CELL_FRAC": (0, 0.5), "LINE_TOL_FRAC": (0, 0.5),
+    "PAGE_SOLID_MIN": (0, 0.5), "CUTLINE_MAX_THICK_FRAC": (0.001, 0.1),
+    "STRIPE_EDGES": (0, 20), "BORDER_CUT_MIN_INK": (0, 1),
 }
 INTS = {"MAX_PAGES", "KEEP_JOBS", "DETECT_PX", "GRID_CELLS", "LINE_MIN_COUNT",
         "DARK", "GRID_INK", "UPSCALE"}
@@ -496,8 +512,9 @@ def page(cfg, info, flash=None, errors=None, recrop_result=None, recrop_job=None
                      f'<div class="cap">label {i+1}</div></div>')
         h.append("</div><p class=hint>")
         for p in recrop_result["previews"]:
-            if p["reason"] == "blank":
-                h.append(f'<span class="tag">page {p["page"]+1}: blank, skipped</span>')
+            if not p.get("clip"):
+                h.append(f'<span class="tag">page {p["page"]+1}: '
+                         f'{esc(p["reason"])}, skipped</span>')
             else:
                 h.append(f'<span class="tag">page {p["page"]+1}: {esc(p["reason"])}, '
                          f'rotate {p["rotate"]}, scale {p["scale"]:.2f}</span>')
