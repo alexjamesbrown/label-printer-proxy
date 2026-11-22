@@ -125,11 +125,16 @@ stricter rules than on a bare page. Each came from something that went wrong:
   border every row spans the border's width, because the border's own sides are
   ink at both ends, so on the page grid nothing is a spike. The border strokes
   are peeled off and the interior analysed on its own.
-- **A cut line must be thin at pixel level.** Two rows of two-column text (a
-  sentence on the left, a shop address on the right) spanned the interior on
-  the grid exactly like a rule, and were picked. At pixel level no single row
-  of them reached across, while a rule is one or two rows that do.
-  `CUTLINE_MAX_THICK_FRAC` caps the wide pixel rows.
+- **Cut lines are found at pixel level, not on the grid.** On the grid, two
+  rows of two-column text (a sentence on the left, a shop address on the
+  right) spanned the interior exactly like a rule and were picked, while the
+  real cut (a light grey band, the dashes, and the label's own top rule
+  directly under them) filled four cells on the original PDF and five once
+  macOS had re-paginated it to A4, and was missed as "a block, not a line".
+  At pixel level the structural cut is one dark row that reaches across the
+  interior, text is five or more rows deep, and the grey band is not dark at
+  all. A candidate is a run of wide dark pixel rows no taller than
+  `CUTLINE_MAX_THICK_FRAC` of the page.
 - **Sides are scored on striped ink, not solid ink.** The grey banner is as
   solid as a barcode on an averaged grid, and made the instructions side look
   like the label (ratio 1.2, split refused). Counting ink edges inside each
@@ -148,8 +153,10 @@ stricter rules than on a bare page. Each came from something that went wrong:
 
 The DPD dashes themselves are light grey and vanish at the line-detection
 threshold; the structural cut that gets found is the label's own solid top rule
-directly under them. On the coarse grid the dashes, their grey band and that
-rule occupy four rows together, which is why `CUTLINE_MAX_ROWS` is 4.
+directly under them. Test against what the printer actually receives, not just
+the original file: macOS re-paginates a US Letter PDF to A4 on the way through
+AirPrint, and the grid-level version of this check passed on the original and
+failed on the job.
 
 ### What the preview shows is not what prints
 

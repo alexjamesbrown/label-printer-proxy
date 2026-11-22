@@ -135,10 +135,8 @@ DEFAULTS = {
     "CUTLINE_NEIGHBOUR_FRAC": "0.75",
     # A rule may straddle two grid rows if it lands on a cell boundary, so the
     # spike is measured over a run of up to this many consecutive wide rows.
-    # Longer than this and it is a block of content, not a line. Four, not
-    # three: on a DPD return sheet the dashed line sits in a light grey band
-    # with the label's own top rule directly under it, and that is four rows.
-    "CUTLINE_MAX_ROWS": "4",
+    # Longer than this and it is a block of content, not a line.
+    "CUTLINE_MAX_ROWS": "3",
     # Inside a drawn border the split is scored on STRIPED ink rather than
     # solid ink: a solid cell whose pixels switch between ink and paper at
     # least this many times per pixel row. A barcode cell measures 27-45 edges
@@ -146,12 +144,15 @@ DEFAULTS = {
     # Without this the DPD banner made the instructions side look as solid as
     # the label and the split was refused.
     "STRIPE_EDGES": "1.5",
-    # Inside a drawn border a cut line must also be THIN at pixel level: no
-    # more than this fraction of the page's long side in wide pixel rows. Two
-    # lines of two-column text span the grid like a rule does, but at pixel
-    # level they are a dozen rows deep and no single row reaches across; a
-    # rule is one or two rows that do. 0.005 is 5 pixel rows at DETECT_PX.
-    "CUTLINE_MAX_THICK_FRAC": "0.005",
+    # Inside a drawn border cut lines are found at PIXEL level, not on the
+    # grid: a run of dark pixel rows reaching across the border's interior,
+    # no taller than this fraction of the page's long side (0.003 is 3 rows
+    # at DETECT_PX). On the grid the DPD cut (light grey band, dashes, the
+    # label's top rule) filled four cells on the original PDF and five once
+    # macOS had re-paginated it to A4, and two lines of two-column text
+    # spanned the grid like a rule did. At pixel level the rule is one row
+    # that reaches across; text is five or more and the grey band is not dark.
+    "CUTLINE_MAX_THICK_FRAC": "0.003",
     # Inside a drawn border the side cut away must hold at least this share
     # of the ink inside the border. A page of instructions is most of the ink
     # on a sheet (66% on the DPD return). A label's own header and address
@@ -632,9 +633,11 @@ def find_label_in_border(border, grid, solid, pix, gw, gh, r, cfg, fitz):
     labels, and a label has rules of its own. So this is stricter than the
     bare-page split in three ways, each learnt from real or synthetic input:
 
-      - a cut must be *thin* at pixel level (CUTLINE_MAX_THICK_FRAC). Two
-        rows of two-column text spanned the DPD sheet like a rule on the grid
-        and were taken for one; at pixel level no row of them reached across;
+      - cuts are found at *pixel* level (CUTLINE_MAX_THICK_FRAC): a thin run
+        of dark rows reaching across the interior. On the grid, two rows of
+        two-column text spanned the DPD sheet like a rule and were taken for
+        one, while the real cut (grey band, dashes, the label's top rule)
+        filled four or five cells depending on the page size and was missed;
       - sides are scored on *striped* ink, not solid ink, because the sheet's
         grey header banner is as solid as a barcode and made the instructions
         side look like the label;
@@ -681,32 +684,38 @@ def find_label_in_border(border, grid, solid, pix, gw, gh, r, cfg, fitz):
         src = (gy0 + y) * gw + gx0
         sub_grid[y * sw:(y + 1) * sw] = grid[src:src + sw]
     rows = _row_profile(sub_grid, sw, sh)
-    cuts = _cut_rows(rows, sw, sh, cfg)
 
-    # Pixel geometry of the interior, for the thinness test.
+    # Cut candidates from the pixels: runs of dark rows that reach across the
+    # interior and are no taller than a rule. The interior is inset a little
+    # further so a border stroke straddling a grid cell cannot make every row
+    # look wide.
     pcw, pch = pix.width / float(gw), pix.height / float(gh)
-    px0, px1 = int(gx0 * pcw), int(gx1 * pcw)
+    inset = int(0.02 * (gx1 - gx0) * pcw)
+    px0, px1 = int(gx0 * pcw) + inset, int(gx1 * pcw) - inset
+    py0, py1 = int(gy0 * pch), int(gy1 * pch)
     dark = int(num(cfg, "DARK"))
     t_bin = bytes(1 if i < dark else 0 for i in range(256))
     thick_max = num(cfg, "CUTLINE_MAX_THICK_FRAC") * max(pix.width, pix.height)
     span_min = num(cfg, "CUTLINE_SPAN_FRAC") * (px1 - px0)
 
-    def thin_rule(c):
-        """1..thick_max pixel rows reaching across the interior near row c."""
-        wide = 0
-        for py in range(int((gy0 + c - 2) * pch), int((gy0 + c + 3) * pch)):
-            if py < 0 or py >= pix.height:
-                continue
-            row = pix.samples[py * pix.stride + px0:py * pix.stride + px1].translate(t_bin)
-            if 1 not in row:
-                continue
-            first = row.index(1)
-            last = len(row) - 1 - row[::-1].index(1)
-            if last - first + 1 >= span_min:
-                wide += 1
-        return 1 <= wide <= thick_max
+    def wide(py):
+        row = pix.samples[py * pix.stride + px0:py * pix.stride + px1].translate(t_bin)
+        if 1 not in row:
+            return False
+        return len(row) - row[::-1].index(1) - row.index(1) >= span_min
 
-    cuts = [c for c in cuts if thin_rule(c)]
+    cuts, py = [], py0
+    while py < py1:
+        if not wide(py):
+            py += 1
+            continue
+        start = py
+        while py < py1 and wide(py):
+            py += 1
+        if py - start <= thick_max:
+            c = int((start + py) / 2 / pch) - gy0
+            if 0 < c < sh - 1 and c not in cuts:
+                cuts.append(c)
     if not cuts:
         return None
 
