@@ -380,9 +380,19 @@ rendered with a blank name, and the phone saved that blank. Renaming the
 service to `Auto-Crop Label Printer` fixed the live entry, but the stored one
 kept the blank forever, and because the live record matched it the new name
 never appeared under Other Printers either. Avahi restarts, reflector
-behaviour and the record itself were all innocent. The fix is on the phone:
-swipe the blank Known Printer row to the left and remove it, then pick the
-queue from Other Printers once, and it is stored again under its real name.
+behaviour and the record itself were all innocent.
+
+iOS offers no way to forget a known printer short of Reset Network Settings,
+and what it keys the stored entry on is the printer's **address**: the mDNS
+hostname plus the queue path. Changing the queue's UUID made the renamed
+service appear under Other Printers, but tapping it still selected the blank
+stored entry. Changing the hostname broke the link: the blank row vanished and
+the queue was stored afresh under its real name. So the fix is a new mDNS
+hostname, which `setup.sh` takes as `BONJOUR_HOST=<name>` (it writes
+`host-name=` in `avahi-daemon.conf` and leaves it alone when unset). Clients
+that address the proxy by IP, as the CUPS queues in the install notes do, are
+unaffected. The same trick works for any printer whose phone entry is stale:
+give it a new node name in its own web interface.
 
 ### mDNS reflectors have finite capacity, and overrunning one takes OTHER devices offline
 

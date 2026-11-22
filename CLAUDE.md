@@ -92,10 +92,10 @@ user, not as yourself.
   The systemd unit is `labelui.systemd`. A raw `<` in a TXT value silently
   invalidates the whole Avahi file. Avoid parentheses in the Bonjour name
   (iOS rendered it blank), and remember that iOS keeps the first name it saw
-  for a printer in "Known Printers": a rename, UUID change or Avahi restart on
-  the server cannot fix a stale entry on a phone. See the README section "iOS
-  remembers the name a printer had the first time you used it" before
-  debugging a blank or wrong name server-side.
+  for a printer in "Known Printers", keyed on mDNS hostname plus queue path:
+  a rename, UUID change or Avahi restart cannot fix a stale phone entry, only
+  a new hostname (`BONJOUR_HOST=` to `setup.sh`) can. See the README section
+  "iOS remembers the name a printer had the first time you used it".
 - `labelproxy.ppd` is a minimal PDF-passthrough PPD carrying the AirPrint URF
   advertisement.
 - `labelproxy.conf` and `labelui.default` are installed only on first setup;
