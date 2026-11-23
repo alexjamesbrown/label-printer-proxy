@@ -30,7 +30,7 @@ what Debian 12 ships and is the real target.
 `test_crop.py` has no per-case assertions. It prints a table (result reason,
 rotation, scale) and exits non-zero only if `build()` or the preview renderer
 throws. The README's "Testing without a printer" table lists the expected
-reason and rotation for each of the nine cases; compare the printed table
+reason and rotation for each of the ten cases; compare the printed table
 against it by eye, and open the PNGs (input with detected box in red on the
 left, output label pages on the right). There is no way to run a single case
 other than editing the `CASES` list. Run this before any detection change.
@@ -63,7 +63,11 @@ import. `test_crop.py` and `labelui` both load it by path with
   full-height vertical gutter between a solid-ink column and columns that are
   text only (below `PAGE_SOLID_MIN`), which is the Royal Mail
   label-beside-instructions sheet; see "A label beside its instructions" in the
-  README before loosening it. Inside
+  README before loosening it. The gutter is searched in the content's frame:
+  an iPhone turns a landscape sheet a quarter turn onto portrait A4, so the
+  text direction (`info["text_dir"]`) decides the axis and the sign of the
+  final rotation. Always test against the `*-in.pdf` a phone actually sent,
+  not the original file. Inside
   a border the cut-line split is held to stricter rules (thin at pixel level,
   striped-ink scoring, the cut-away side must hold most of the ink); see the
   README's "A cut line inside a border". `info["solid"]` gets the page's

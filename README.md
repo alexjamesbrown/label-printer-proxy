@@ -144,6 +144,19 @@ Columns are built from the connected components that survive the content-box
 pass, so a speck in the gutter cannot bridge it and a browser header spanning
 the page cannot hide it.
 
+**A "column" is a column of the content, not of the page.** The first version
+only looked for vertical gutters. It passed on the PDF, and did nothing on the
+job the iPhone sent, because AirPrint clients re-paginate a landscape sheet
+onto portrait A4 by turning it a quarter turn: the label arrived *below* the
+instructions, sideways, with a horizontal gutter. The direction the page's
+text runs (weighted by length, after the page's own rotation) says which way
+the content faces, and the gutter search runs in that frame. In the turned
+frame a label's own stacked blocks are still rows, so they are still never
+split. The same text direction then picks the sign of the final quarter turn,
+so the label prints the right way up instead of upside down. Image-only input
+has no text and counts as upright. Once more: test against what the printer
+receives (`/var/lib/labelproxy/*-in.pdf`), not the file on disk.
+
 The known gap: a borderless label laid out as a text column beside a barcode
 column, with nothing at all spanning both, would lose its text. No real label
 seen so far is drawn that way, and a drawn border or any spanning element
@@ -313,12 +326,13 @@ pip install pymupdf
 python3 test_crop.py /tmp/testout
 ```
 
-Generates nine representative inputs (bordered label on A4, label with browser
+Generates ten representative inputs (bordered label on A4, label with browser
 header and footer, full-page text document, two-page PDF with a blank page 2,
 landscape label, PNG screenshot, instructions-then-label, instruction page then
-a bordered sheet, label beside a column of instructions), runs the real
-detection and placement code, and writes PNG previews with the detected crop
-boxed in red beside the output label pages.
+a bordered sheet, label beside a column of instructions, and that same sheet
+turned onto portrait A4 as an iPhone sends it), runs the real detection and
+placement code, and writes PNG previews with the detected crop boxed in red
+beside the output label pages.
 
 | case | expected | rotate |
 |---|---|---|
@@ -331,6 +345,7 @@ boxed in red beside the output label pages.
 | instructions + cut line, label below | block | **90** |
 | text page, then bordered sheet with cut line | border-block, 1 skipped | **90** |
 | borderless label beside a column of instructions | column | 0 |
+| the same sheet turned onto portrait A4, as an iPhone sends it | column | **270** |
 
 Run this before deploying any detection change. It is far cheaper than feeding
 the roll. CI runs it on 3.11, 3.12 and 3.13 and uploads the previews as

@@ -357,6 +357,28 @@ def case_label_beside_instructions(path):
     doc.close()
 
 
+def case_label_beside_instructions_rotated(path):
+    """Case 09 as an iPhone actually sends it: turned a quarter turn onto portrait A4.
+
+    AirPrint clients re-paginate a landscape sheet onto portrait A4 by
+    rotating it, so the label arrives *below* the instructions, sideways, and
+    the gutter between them is horizontal. The first version of the column
+    split only looked for vertical gutters, passed on the original file, and
+    did nothing on the job the phone sent. Test against what the printer
+    receives, not the file on disk.
+    """
+    tmp = path + ".landscape.pdf"
+    case_label_beside_instructions(tmp)
+    src = fitz.open(tmp)
+    doc = fitz.open()
+    p = doc.new_page(width=A4[0], height=A4[1])
+    p.show_pdf_page(p.rect, src, 0, rotate=90)
+    doc.save(path)
+    doc.close()
+    src.close()
+    os.remove(tmp)
+
+
 CASES = [
     ("01-bordered-label-a4", "pdf", case_bordered_a4,
      "bordered carrier label on A4"),
@@ -376,6 +398,8 @@ CASES = [
      "text page, then bordered sheet with cut line"),
     ("09-label-beside-instructions", "pdf", case_label_beside_instructions,
      "borderless label beside a column of instructions"),
+    ("10-beside-instructions-turned", "pdf", case_label_beside_instructions_rotated,
+     "the same sheet turned onto portrait A4, as an iPhone sends it"),
 ]
 
 
