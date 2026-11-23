@@ -30,3 +30,9 @@ _Avoid_: Cover page, text page, blank page (a blank page has no ink at all)
 A box drawn around a label or a sheet. A border around a sheet encloses the
 cut line and the label together.
 _Avoid_: Frame, outline
+
+**Gutter**:
+A band of empty page running the full height of the content, separating a
+label from a column of instructions printed beside it. The only whitespace
+the detector ever splits on.
+_Avoid_: Gap, margin, whitespace (a gap between stacked blocks is never split)

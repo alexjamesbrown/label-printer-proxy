@@ -30,7 +30,7 @@ what Debian 12 ships and is the real target.
 `test_crop.py` has no per-case assertions. It prints a table (result reason,
 rotation, scale) and exits non-zero only if `build()` or the preview renderer
 throws. The README's "Testing without a printer" table lists the expected
-reason and rotation for each of the eight cases; compare the printed table
+reason and rotation for each of the nine cases; compare the printed table
 against it by eye, and open the PNGs (input with detected box in red on the
 left, output label pages on the right). There is no way to run a single case
 other than editing the `CASES` list. Run this before any detection change.
@@ -54,11 +54,16 @@ import. `test_crop.py` and `labelui` both load it by path with
   in it, so a new setting appears in the UI automatically (under "Advanced"
   unless added to `FIELDS` in `labelui`).
 - `detect_page(page, cfg, info=None)`: returns `(clip_rect | None, reason)`
-  where reason is `border` / `border-block` / `block` / `content` /
+  where reason is `border` / `border-block` / `block` / `column` / `content` /
   `full-page` / `blank`. Order is fixed and deliberate: drawn border box beats
-  cut-line block splitting beats ink bbox. Do not reorder. Block splitting
-  fires only when an explicit cut rule is found, never on whitespace (see
-  README for the barcode-without-address failure that motivated this). Inside
+  cut-line block splitting beats column splitting beats ink bbox. Do not
+  reorder. Block splitting fires only when an explicit cut rule is found,
+  never on horizontal whitespace (see README for the barcode-without-address
+  failure that motivated this). The only whitespace split is `column`: a
+  full-height vertical gutter between a solid-ink column and columns that are
+  text only (below `PAGE_SOLID_MIN`), which is the Royal Mail
+  label-beside-instructions sheet; see "A label beside its instructions" in the
+  README before loosening it. Inside
   a border the cut-line split is held to stricter rules (thin at pixel level,
   striped-ink scoring, the cut-away side must hold most of the ink); see the
   README's "A cut line inside a border". `info["solid"]` gets the page's

@@ -137,6 +137,23 @@ DEFAULTS = {
     # spike is measured over a run of up to this many consecutive wide rows.
     # Longer than this and it is a block of content, not a line.
     "CUTLINE_MAX_ROWS": "3",
+    # --- column splitting ----------------------------------------------------
+    # Royal Mail returns (via Cycleon) print the label on the LEFT of a
+    # landscape sheet and "PACKING INSTRUCTIONS" on the right: no border, no
+    # cut line. Nothing above fires, the ink bbox spans both, and the label
+    # prints at half size with the instructions beside it. A gutter of empty
+    # grid columns at least this fraction of the page wide, running the FULL
+    # height of the content, separates columns. This is the one whitespace
+    # split allowed, and only because a vertical gutter is a far stronger
+    # signal than the horizontal gap that broke whitespace splitting: a label
+    # nearly always has something spanning its own width (a header, a rule, a
+    # barcode), so a gutter never falls inside one. The kept column must clear
+    # BLOCK_SOLID_MIN and cover BLOCK_MIN_AREA_FRAC of the page; every other
+    # column must be text only, below PAGE_SOLID_MIN, so anything with a
+    # barcode, QR code or filled block on both sides is left whole. Measured
+    # on the real sheet: gutter 10% of the page, label 13% solid, instructions
+    # 0.1% solid.
+    "COLUMN_GAP_FRAC": "0.05",
     # Inside a drawn border the split is scored on STRIPED ink rather than
     # solid ink: a solid cell whose pixels switch between ink and paper at
     # least this many times per pixel row. A barcode cell measures 27-45 edges
@@ -570,7 +587,7 @@ def find_content_box(page, cfg, fitz):
     inked = sum(grid)
     frac = inked / float(gw * gh)
     if not inked:
-        return None, frac, (grid, solid, gw, gh)
+        return None, frac, (grid, solid, gw, gh, [])
 
     comps = _components(grid, gw, gh)
     min_cells = max(1, int(round(num(cfg, "SPECK_AREA_FRAC") * gw * gh)))
@@ -605,7 +622,80 @@ def find_content_box(page, cfg, fitz):
         r.x0 + max(c[2] for c in keep) * cw,
         r.y0 + max(c[3] for c in keep) * ch,
     ) & r
-    return box, frac, (grid, solid, gw, gh)
+    return box, frac, (grid, solid, gw, gh, keep)
+
+
+def find_label_column(comps, solid, gw, gh, cfg):
+    """Pick the label out of a page that carries its instructions beside it.
+
+    Royal Mail return sheets print on landscape A4: the label on the left with
+    nothing drawn round it, and a column of packing instructions on the right.
+    There is no cut line, so find_label_block never fires, and the ink bbox
+    spans both, which prints the instructions and shrinks the label to about
+    half the roll.
+
+    Splitting on whitespace is exactly what find_label_block refuses to do,
+    and for good reason (see there). A column gutter is a much stronger signal
+    than a horizontal gap, and it is still held to stricter rules than the
+    cut-line split:
+
+      - the gutter must be at least COLUMN_GAP_FRAC of the page wide and run
+        the full height of the content: no component may reach across it. A
+        label nearly always has something spanning its own width (a header, a
+        rule, a barcode), so a gutter never falls inside one. The address-
+        over-barcode gap that broke whitespace splitting is horizontal, and
+        this never looks at horizontal gaps;
+      - the kept column must cover BLOCK_MIN_AREA_FRAC of the page and clear
+        BLOCK_SOLID_MIN, as a cut-line side must;
+      - every other column must be text only: below PAGE_SOLID_MIN solid ink,
+        the same test that makes a page an instruction page. A column with a
+        barcode, QR code or filled block in it keeps the page whole.
+
+    The known gap: a borderless label laid out as a text column beside a
+    barcode column, with nothing at all spanning both, would lose its text.
+    No real label seen so far is drawn that way.
+
+    comps are the kept components from find_content_box, so specks and edge
+    strips can neither bridge a gutter nor fake a column. Returns a grid-space
+    (x0, y0, x1, y1) box, or None to leave the page alone.
+    """
+    gap_min = max(1, int(round(num(cfg, "COLUMN_GAP_FRAC") * gw)))
+    groups = []  # [x0, x1, [components]]
+    for c in sorted(comps):
+        if groups and c[0] - groups[-1][1] < gap_min:
+            groups[-1][1] = max(groups[-1][1], c[2])
+            groups[-1][2].append(c)
+        else:
+            groups.append([c[0], c[2], [c]])
+    if len(groups) < 2:
+        return None
+
+    def box(g):
+        cs = g[2]
+        return (min(c[0] for c in cs), min(c[1] for c in cs),
+                max(c[2] for c in cs), max(c[3] for c in cs))
+
+    def solid_in(b):
+        x0, y0, x1, y1 = b
+        n = sum(sum(solid[gy * gw + x0:gy * gw + x1]) for gy in range(y0, y1))
+        return n / float((x1 - x0) * (y1 - y0))
+
+    scored = sorted(((solid_in(box(g)), box(g)) for g in groups), reverse=True)
+    best_solid, best = scored[0]
+    area = (best[2] - best[0]) * (best[3] - best[1]) / float(gw * gh)
+    log("DEBUG", f"{len(groups)} columns; densest is {best_solid:.1%} solid "
+                 f"({area:.0%} of page), next {scored[1][0]:.1%}")
+    if area < num(cfg, "BLOCK_MIN_AREA_FRAC"):
+        log("DEBUG", "the densest column is too small to be a label, leaving the page")
+        return None
+    if best_solid < num(cfg, "BLOCK_SOLID_MIN"):
+        log("DEBUG", "no column is solid enough to be a label, leaving the page")
+        return None
+    if any(s >= num(cfg, "PAGE_SOLID_MIN") for s, _ in scored[1:]):
+        log("DEBUG", "another column has solid ink too, so it is not just "
+                     "instructions, leaving the page")
+        return None
+    return best
 
 
 def _grid_rect(box, r, gw, gh, fitz):
@@ -759,8 +849,11 @@ def detect_page(page, cfg, info=None):
          label, in which case the label side is kept
       2. failing a border, the densest side of a cut line on the bare page,
          which is how a label sitting under a page of instructions is found
-      3. failing that, the ink bounding box
-      4. and if that covers most of the page, the page *is* the content, so no
+      3. failing a cut line, the densest of several columns separated by a
+         full-height gutter, when every other column is text only, which is
+         how a label sitting beside its instructions is found
+      4. failing that, the ink bounding box
+      5. and if that covers most of the page, the page *is* the content, so no
          crop at all
 
     A drawn border always wins over a density guess: it is an explicit statement
@@ -769,8 +862,8 @@ def detect_page(page, cfg, info=None):
     width and the outer extent, and only ever trims top or bottom off it.
 
     Returns (clip_rect_or_None, reason). None means "blank, skip this page".
-    reason is one of: border / border-block / block / content / full-page /
-    blank. Whether a page is an *instruction page* is not decided here: that
+    reason is one of: border / border-block / block / column / content /
+    full-page / blank. Whether a page is an *instruction page* is not decided here: that
     depends on the other pages in the job, so build() does it from the solid
     ink fraction this leaves in info["solid"] when given a dict.
     """
@@ -778,7 +871,7 @@ def detect_page(page, cfg, info=None):
     r = page.rect
     page_area = r.width * r.height or 1.0
 
-    content, frac, (grid, solid, gw, gh) = find_content_box(page, cfg, fitz)
+    content, frac, (grid, solid, gw, gh, comps) = find_content_box(page, cfg, fitz)
     if info is not None:
         info["solid"] = sum(solid) / float(gw * gh)
     if content is None or frac < num(cfg, "BLANK_CELL_FRAC"):
@@ -804,15 +897,17 @@ def detect_page(page, cfg, info=None):
             clip, reason = inner, "border-block"
     else:
         # No drawn border. Is this a multi-part page - instructions, a cut
-        # line, then the real label? Whitespace alone never splits (see
-        # find_label_block).
-        block = find_label_block(grid, solid, gw, gh, cfg)
+        # line, then the real label? Horizontal whitespace alone never splits
+        # (see find_label_block). Failing that, is the label beside a column
+        # of text, across a full-height gutter (see find_label_column)?
+        block, reason = find_label_block(grid, solid, gw, gh, cfg), "block"
+        if block is None:
+            block, reason = find_label_column(comps, solid, gw, gh, cfg), "column"
         if block is None:
             clip, reason = content, "content"
         else:
             clip = _grid_rect(block, r, gw, gh, fitz)
             clip = clip & content if (clip & content).get_area() > 0 else clip
-            reason = "block"
 
     if clip.get_area() > num(cfg, "SKIP_CROP_AREA") * page_area:
         log("DEBUG", f"{reason} box covers {clip.get_area() / page_area:.0%} "
