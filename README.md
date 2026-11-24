@@ -45,10 +45,15 @@ Per page, in order:
    carries an explicit "cut here" rule it is split there and the denser side
    kept. This is the "instructions at the top, cut line, real label underneath"
    shape that InPost and others use.
-3. **Content bounding box.** Ink bbox on a coarse grid, with connected
+3. **The solid column beside a text-only column.** Failing a cut line, if a
+   full-height gutter splits the content into columns, one of them is solid
+   with barcodes and every other is nothing but text, the solid one is kept.
+   This is the "label on the left, packing instructions on the right" shape
+   of a Royal Mail return (see "A label beside its instructions" below).
+4. **Content bounding box.** Ink bbox on a coarse grid, with connected
    components used to throw away isolated specks and thin strips hugging the
    top or bottom edge: browser print headers, URLs, date stamps, page numbers.
-4. **None of the above.** If the detected region covers more than 85% of the
+5. **None of the above.** If the detected region covers more than 85% of the
    page, the page *is* the content. No crop, just fit.
 
 Then rotate to whichever orientation scales larger (but only if it wins by a
@@ -80,7 +85,9 @@ borderless label whose address sits above its barcode with as little as a 40pt
 gap was split in two, with the barcode winning on solid ink. The result is a
 printed barcode with no addressee, which is worse than not cropping at all. The
 ratio test gives no protection there, because text scores 0% solid and the ratio
-is effectively infinite.
+is effectively infinite. The one whitespace split that is allowed is a
+full-height *vertical* gutter between a label and a text-only column, under its
+own rules (next section); horizontal gaps never split a page.
 
 Three things make this detectable, and one obvious thing does not:
 
@@ -107,6 +114,53 @@ The kept side must clear `BLOCK_SOLID_MIN` and beat the other side by
 removes a "YOU MUST ATTACH THIS LABEL" banner while leaving a multi-line address
 block alone. If nothing stands out the page is left whole, which is the safe
 outcome.
+
+### A label beside its instructions
+
+Royal Mail returns (the Cycleon-generated kind) print on landscape A4 with the
+label on the left and a column of "PACKING INSTRUCTIONS" on the right. Nothing
+is drawn round the label, there is no cut line anywhere, and the label's only
+structure is a few horizontal rules spanning its own width. So nothing above
+fires, the ink bbox spans both halves, and the roll got the instructions beside
+a label at 59% of the page.
+
+The signal here is a **gutter**: a band of empty columns, `COLUMN_GAP_FRAC` of
+the page wide (10% on the real sheet), that runs the full height of the content
+with no ink component reaching across it. That is a much stronger signal than
+the horizontal gap that made whitespace splitting unsafe, because a label nearly
+always has *something* spanning its own width: a header, a rule, a barcode. A
+gutter therefore does not fall inside a label; it falls between a label and
+whatever was printed next to it. Even so it is held to stricter rules than the
+cut-line split:
+
+- the kept column must cover `BLOCK_MIN_AREA_FRAC` of the page and clear
+  `BLOCK_SOLID_MIN`, as a cut-line side must (13% solid on the real sheet);
+- **every other column must be text only**, below `PAGE_SOLID_MIN`, which is
+  the same test that makes a whole page an instruction page (0.1% on the real
+  sheet). A column with a barcode, QR code or filled block in it means this is
+  not a label-plus-instructions layout, and the page prints whole.
+
+Columns are built from the connected components that survive the content-box
+pass, so a speck in the gutter cannot bridge it and a browser header spanning
+the page cannot hide it.
+
+**A "column" is a column of the content, not of the page.** The first version
+only looked for vertical gutters. It passed on the PDF, and did nothing on the
+job the iPhone sent, because AirPrint clients re-paginate a landscape sheet
+onto portrait A4 by turning it a quarter turn: the label arrived *below* the
+instructions, sideways, with a horizontal gutter. The direction the page's
+text runs (weighted by length, after the page's own rotation) says which way
+the content faces, and the gutter search runs in that frame. In the turned
+frame a label's own stacked blocks are still rows, so they are still never
+split. The same text direction then picks the sign of the final quarter turn,
+so the label prints the right way up instead of upside down. Image-only input
+has no text and counts as upright. Once more: test against what the printer
+receives (`/var/lib/labelproxy/*-in.pdf`), not the file on disk.
+
+The known gap: a borderless label laid out as a text column beside a barcode
+column, with nothing at all spanning both, would lose its text. No real label
+seen so far is drawn that way, and a drawn border or any spanning element
+protects it.
 
 ### A cut line inside a border
 
@@ -253,6 +307,7 @@ work.
 | `PAGE_SOLID_MIN` | 0.005 | below this much solid ink a page is an instruction page, skipped if another page has a label |
 | `UPSCALE` / `UPSCALE_MAX` | 1 / 0 | scale small content up to fill, uncapped |
 | `BLOCK_SOLID_RATIO` / `BLOCK_SOLID_MIN` | 2.0 / 0.05 | how clearly a block must stand out to be taken as the label |
+| `COLUMN_GAP_FRAC` | 0.05 | how wide a full-height gutter must be, as a fraction of the page, to separate a label from a text column beside it |
 | `KEEP_JOBS` | 5 | in/out PDF pairs retained for debugging |
 
 Changing the config needs no restart. The backend rereads it on every job.
@@ -271,11 +326,13 @@ pip install pymupdf
 python3 test_crop.py /tmp/testout
 ```
 
-Generates eight representative inputs (bordered label on A4, label with browser
+Generates ten representative inputs (bordered label on A4, label with browser
 header and footer, full-page text document, two-page PDF with a blank page 2,
 landscape label, PNG screenshot, instructions-then-label, instruction page then
-a bordered sheet), runs the real detection and placement code, and writes PNG
-previews with the detected crop boxed in red beside the output label pages.
+a bordered sheet, label beside a column of instructions, and that same sheet
+turned onto portrait A4 as an iPhone sends it), runs the real detection and
+placement code, and writes PNG previews with the detected crop boxed in red
+beside the output label pages.
 
 | case | expected | rotate |
 |---|---|---|
@@ -287,6 +344,8 @@ previews with the detected crop boxed in red beside the output label pages.
 | PNG screenshot | border | 0 |
 | instructions + cut line, label below | block | **90** |
 | text page, then bordered sheet with cut line | border-block, 1 skipped | **90** |
+| borderless label beside a column of instructions | column | 0 |
+| the same sheet turned onto portrait A4, as an iPhone sends it | column | **270** |
 
 Run this before deploying any detection change. It is far cheaper than feeding
 the roll. CI runs it on 3.11, 3.12 and 3.13 and uploads the previews as

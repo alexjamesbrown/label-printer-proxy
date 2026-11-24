@@ -137,6 +137,26 @@ DEFAULTS = {
     # spike is measured over a run of up to this many consecutive wide rows.
     # Longer than this and it is a block of content, not a line.
     "CUTLINE_MAX_ROWS": "3",
+    # --- column splitting ----------------------------------------------------
+    # Royal Mail returns (via Cycleon) print the label on the LEFT of a
+    # landscape sheet and "PACKING INSTRUCTIONS" on the right: no border, no
+    # cut line. Nothing above fires, the ink bbox spans both, and the label
+    # prints at half size with the instructions beside it. A gutter of empty
+    # grid columns at least this fraction of the page wide, running the FULL
+    # height of the content, separates columns. This is the one whitespace
+    # split allowed, and only because a vertical gutter is a far stronger
+    # signal than the horizontal gap that broke whitespace splitting: a label
+    # nearly always has something spanning its own width (a header, a rule, a
+    # barcode), so a gutter never falls inside one. The kept column must clear
+    # BLOCK_SOLID_MIN and cover BLOCK_MIN_AREA_FRAC of the page; every other
+    # column must be text only, below PAGE_SOLID_MIN, so anything with a
+    # barcode, QR code or filled block on both sides is left whole. Measured
+    # on the real sheet: gutter 10% of the page, label 13% solid, instructions
+    # 0.1% solid. "Column" means a column of the CONTENT, not of the page: an
+    # iPhone re-paginates the landscape sheet onto portrait A4 by turning it a
+    # quarter turn, so the gutter arrives horizontal. The text's direction says
+    # which way the content faces and the search runs in that frame.
+    "COLUMN_GAP_FRAC": "0.05",
     # Inside a drawn border the split is scored on STRIPED ink rather than
     # solid ink: a solid cell whose pixels switch between ink and paper at
     # least this many times per pixel row. A barcode cell measures 27-45 edges
@@ -570,7 +590,7 @@ def find_content_box(page, cfg, fitz):
     inked = sum(grid)
     frac = inked / float(gw * gh)
     if not inked:
-        return None, frac, (grid, solid, gw, gh)
+        return None, frac, (grid, solid, gw, gh, [])
 
     comps = _components(grid, gw, gh)
     min_cells = max(1, int(round(num(cfg, "SPECK_AREA_FRAC") * gw * gh)))
@@ -605,7 +625,125 @@ def find_content_box(page, cfg, fitz):
         r.x0 + max(c[2] for c in keep) * cw,
         r.y0 + max(c[3] for c in keep) * ch,
     ) & r
-    return box, frac, (grid, solid, gw, gh)
+    return box, frac, (grid, solid, gw, gh, keep)
+
+
+def _text_direction(page, fitz):
+    """The way most of the page's text runs, as a unit vector on the page as
+    shown: (1, 0) left to right, (0, -1) bottom to top, and so on.
+
+    iOS and macOS re-paginate a landscape sheet onto portrait A4 by turning
+    it a quarter turn, so a label that was *beside* its instructions arrives
+    *below* them, sideways, and the gutter between them is horizontal. The
+    direction the text runs says which way the content faces: the gutter
+    search runs in the content's frame rather than the page's, and the final
+    rotation is chosen so the label reads the right way up. Lines are weighted
+    by length so a sideways "SENDER'S ADDRESS" sliver cannot outvote the
+    sheet. Image-only input has no text and counts as upright.
+    """
+    m = page.rotation_matrix  # dir is reported in the unrotated frame
+    votes = {}
+    for block in page.get_text("dict").get("blocks", []):
+        for line in block.get("lines", []):
+            dx, dy = line["dir"]
+            vx, vy = dx * m.a + dy * m.c, dx * m.b + dy * m.d
+            key = (0, 1 if vy > 0 else -1) if abs(vy) > abs(vx) \
+                else (1 if vx > 0 else -1, 0)
+            votes[key] = votes.get(key, 0) + sum(len(s["text"]) for s in line["spans"])
+    return max(votes, key=votes.get) if votes else (1, 0)
+
+
+def _transpose(grid, gw, gh):
+    """The gw x gh grid as a gh x gw grid: rows become columns."""
+    out = bytearray(gw * gh)
+    for gy in range(gh):
+        out[gy::gh] = grid[gy * gw:(gy + 1) * gw]
+    return out
+
+
+def find_label_column(comps, solid, gw, gh, cfg, sideways=False):
+    """Pick the label out of a page that carries its instructions beside it.
+
+    Royal Mail return sheets print on landscape A4: the label on the left with
+    nothing drawn round it, and a column of packing instructions on the right.
+    There is no cut line, so find_label_block never fires, and the ink bbox
+    spans both, which prints the instructions and shrinks the label to about
+    half the roll.
+
+    Splitting on whitespace is exactly what find_label_block refuses to do,
+    and for good reason (see there). A column gutter is a much stronger signal
+    than a horizontal gap, and it is still held to stricter rules than the
+    cut-line split:
+
+      - the gutter must be at least COLUMN_GAP_FRAC of the page wide and run
+        the full height of the content: no component may reach across it. A
+        label nearly always has something spanning its own width (a header, a
+        rule, a barcode), so a gutter never falls inside one. The address-
+        over-barcode gap that broke whitespace splitting is horizontal, and
+        this never looks at horizontal gaps;
+      - the kept column must cover BLOCK_MIN_AREA_FRAC of the page and clear
+        BLOCK_SOLID_MIN, as a cut-line side must;
+      - every other column must be text only: below PAGE_SOLID_MIN solid ink,
+        the same test that makes a page an instruction page. A column with a
+        barcode, QR code or filled block in it keeps the page whole.
+
+    The known gap: a borderless label laid out as a text column beside a
+    barcode column, with nothing at all spanning both, would lose its text.
+    No real label seen so far is drawn that way.
+
+    "Column" is a column of the *content*. When the sheet arrives turned a
+    quarter turn (sideways=True: how an iPhone re-paginates landscape onto
+    portrait A4) the whole analysis is transposed, so the gutter is horizontal
+    on the page but still runs across the text, and a label's own stacked
+    blocks are still never split.
+
+    comps are the kept components from find_content_box, so specks and edge
+    strips can neither bridge a gutter nor fake a column. Returns a grid-space
+    (x0, y0, x1, y1) box, or None to leave the page alone.
+    """
+    if sideways:
+        comps = [(y0, x0, y1, x1, n) for x0, y0, x1, y1, n in comps]
+        solid, gw, gh = _transpose(solid, gw, gh), gh, gw
+    gap_min = max(1, int(round(num(cfg, "COLUMN_GAP_FRAC") * gw)))
+    groups = []  # [x0, x1, [components]]
+    for c in sorted(comps):
+        if groups and c[0] - groups[-1][1] < gap_min:
+            groups[-1][1] = max(groups[-1][1], c[2])
+            groups[-1][2].append(c)
+        else:
+            groups.append([c[0], c[2], [c]])
+    if len(groups) < 2:
+        return None
+
+    def box(g):
+        cs = g[2]
+        return (min(c[0] for c in cs), min(c[1] for c in cs),
+                max(c[2] for c in cs), max(c[3] for c in cs))
+
+    def solid_in(b):
+        x0, y0, x1, y1 = b
+        n = sum(sum(solid[gy * gw + x0:gy * gw + x1]) for gy in range(y0, y1))
+        return n / float((x1 - x0) * (y1 - y0))
+
+    scored = sorted(((solid_in(box(g)), box(g)) for g in groups), reverse=True)
+    best_solid, best = scored[0]
+    area = (best[2] - best[0]) * (best[3] - best[1]) / float(gw * gh)
+    log("DEBUG", f"{len(groups)} {'rows of sideways content' if sideways else 'columns'}; "
+                 f"densest is {best_solid:.1%} solid ({area:.0%} of page), "
+                 f"next {scored[1][0]:.1%}")
+    if area < num(cfg, "BLOCK_MIN_AREA_FRAC"):
+        log("DEBUG", "the densest column is too small to be a label, leaving the page")
+        return None
+    if best_solid < num(cfg, "BLOCK_SOLID_MIN"):
+        log("DEBUG", "no column is solid enough to be a label, leaving the page")
+        return None
+    if any(s >= num(cfg, "PAGE_SOLID_MIN") for s, _ in scored[1:]):
+        log("DEBUG", "another column has solid ink too, so it is not just "
+                     "instructions, leaving the page")
+        return None
+    if sideways:
+        best = (best[1], best[0], best[3], best[2])
+    return best
 
 
 def _grid_rect(box, r, gw, gh, fitz):
@@ -759,8 +897,11 @@ def detect_page(page, cfg, info=None):
          label, in which case the label side is kept
       2. failing a border, the densest side of a cut line on the bare page,
          which is how a label sitting under a page of instructions is found
-      3. failing that, the ink bounding box
-      4. and if that covers most of the page, the page *is* the content, so no
+      3. failing a cut line, the densest of several columns separated by a
+         full-height gutter, when every other column is text only, which is
+         how a label sitting beside its instructions is found
+      4. failing that, the ink bounding box
+      5. and if that covers most of the page, the page *is* the content, so no
          crop at all
 
     A drawn border always wins over a density guess: it is an explicit statement
@@ -769,8 +910,8 @@ def detect_page(page, cfg, info=None):
     width and the outer extent, and only ever trims top or bottom off it.
 
     Returns (clip_rect_or_None, reason). None means "blank, skip this page".
-    reason is one of: border / border-block / block / content / full-page /
-    blank. Whether a page is an *instruction page* is not decided here: that
+    reason is one of: border / border-block / block / column / content /
+    full-page / blank. Whether a page is an *instruction page* is not decided here: that
     depends on the other pages in the job, so build() does it from the solid
     ink fraction this leaves in info["solid"] when given a dict.
     """
@@ -778,9 +919,11 @@ def detect_page(page, cfg, info=None):
     r = page.rect
     page_area = r.width * r.height or 1.0
 
-    content, frac, (grid, solid, gw, gh) = find_content_box(page, cfg, fitz)
+    content, frac, (grid, solid, gw, gh, comps) = find_content_box(page, cfg, fitz)
+    text_dir = _text_direction(page, fitz)
     if info is not None:
         info["solid"] = sum(solid) / float(gw * gh)
+        info["text_dir"] = text_dir
     if content is None or frac < num(cfg, "BLANK_CELL_FRAC"):
         return None, "blank"
 
@@ -804,15 +947,19 @@ def detect_page(page, cfg, info=None):
             clip, reason = inner, "border-block"
     else:
         # No drawn border. Is this a multi-part page - instructions, a cut
-        # line, then the real label? Whitespace alone never splits (see
-        # find_label_block).
-        block = find_label_block(grid, solid, gw, gh, cfg)
+        # line, then the real label? Horizontal whitespace alone never splits
+        # (see find_label_block). Failing that, is the label beside a column
+        # of text, across a full-height gutter (see find_label_column)?
+        block, reason = find_label_block(grid, solid, gw, gh, cfg), "block"
+        if block is None:
+            block = find_label_column(comps, solid, gw, gh, cfg,
+                                      sideways=text_dir[0] == 0)
+            reason = "column"
         if block is None:
             clip, reason = content, "content"
         else:
             clip = _grid_rect(block, r, gw, gh, fitz)
             clip = clip & content if (clip & content).get_area() > 0 else clip
-            reason = "block"
 
     if clip.get_area() > num(cfg, "SKIP_CROP_AREA") * page_area:
         log("DEBUG", f"{reason} box covers {clip.get_area() / page_area:.0%} "
@@ -917,7 +1064,7 @@ def build(src_path, out_path, cfg, previews=None):
     # Pass 1: detect. Stops once MAX_PAGES pages with solid ink are in hand,
     # since nothing after them can print: a further label is over the cap and
     # a further instruction page would be skipped.
-    detected = []  # (pno, clip, reason, solid_frac or None)
+    detected = []  # (pno, clip, reason, solid_frac or None, text_dir)
     for pno in range(src.page_count):
         page = src[pno]
         info = {}
@@ -926,18 +1073,19 @@ def build(src_path, out_path, cfg, previews=None):
         except Exception as e:
             log("WARNING", f"page {pno + 1} detection failed ({e}), fitting whole page")
             clip, reason = page.rect, "full-page"
-        detected.append((pno, clip, reason, info.get("solid")))
-        with_label = sum(1 for _, c, _, s in detected
+        detected.append((pno, clip, reason, info.get("solid"),
+                         info.get("text_dir", (1, 0))))
+        with_label = sum(1 for _, c, _, s, _ in detected
                          if c is not None and (s is None or s >= solid_min))
         if with_label >= max_pages:
             break
 
     has_label = any(c is not None and s is not None and s >= solid_min
-                    for _, c, _, s in detected)
+                    for _, c, _, s, _ in detected)
 
     # Pass 2: place.
     used = 0
-    for pno, clip, reason, solid_frac in detected:
+    for pno, clip, reason, solid_frac, text_dir in detected:
         page = src[pno]
         if clip is None:
             log("INFO", f"page {pno + 1} is blank, skipped")
@@ -958,6 +1106,13 @@ def build(src_path, out_path, cfg, previews=None):
         # show_pdf_page wants the clip in unrotated coordinates.
         src_clip = clip * page.derotation_matrix
         rect, rotate, scale = place(src_clip.width, src_clip.height, cfg)
+        # place() only knows the clip's shape. If the roll wants a quarter
+        # turn and the content is already sideways (a sheet an iPhone turned
+        # onto portrait A4), turn it the way that makes the text read
+        # upright rather than upside down. Text running bottom to top was
+        # turned anticlockwise, so it goes back clockwise.
+        if rotate == 90 and text_dir[0] == 0:
+            rotate = 270 if text_dir[1] < 0 else 90
         p = out.new_page(width=page_w, height=page_h)
         p.show_pdf_page(fitz.Rect(*rect), src, pno, clip=src_clip, rotate=rotate)
         used += 1

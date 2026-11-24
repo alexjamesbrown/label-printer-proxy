@@ -298,6 +298,87 @@ def case_instruction_page_then_sheet(path):
     doc.close()
 
 
+def case_label_beside_instructions(path):
+    """A borderless label on the left of a landscape sheet, instructions on the right.
+
+    The Royal Mail Tracked 48 returns shape (via Cycleon). Nothing is drawn
+    round the label; its only structure is a few horizontal rules spanning its
+    own width. There is no cut line anywhere, so the bare-page split never
+    fires, and the ink bbox spanned both halves: the real job printed the
+    instructions beside the label at 59% of the roll. The only things telling
+    the two columns apart are a full-height gutter about a tenth of the page
+    wide and the fact that one side is 13% solid ink and the other 0.1%.
+    """
+    doc = fitz.open()
+    w, h = A4[1], A4[0]
+    p = doc.new_page(width=w, height=h)
+    x0, x1 = 60, 350
+    _text(p, (x0 + 8, 82, x0 + 210, 132), "Tracked  48", fontsize=28, fontname="hebo")
+    _text(p, (x0 + 200, 78, x1, 96), "Delivered by", fontsize=8, fontname="hebo")
+    p.draw_rect(fitz.Rect(x0 + 215, 98, x1 - 10, 158), color=(0, 0, 0), width=1)
+    _text(p, (x0 + 218, 128, x1 - 12, 156), "Royal Mail", fontsize=11, fontname="hebo")
+    _text(p, (x0 + 200, 160, x1, 176), "Postage on Account GB", fontsize=7)
+    p.draw_line((x0, 178), (x1, 178), color=(0, 0, 0), width=0.8)
+    _text(p, (x0 + 20, 180, x1, 196), "24-042 939 6001-378 982 67D", fontsize=7)
+    # 2D barcode stand-in: a solid block with few edges, like the real one.
+    p.draw_rect(fitz.Rect(x0 + 12, 198, x0 + 76, 262), color=None, fill=(0, 0, 0))
+    _barcode(p, fitz.Rect(x0 + 115, 201, x1 - 25, 258), seed=2)
+    _text(p, (x0 + 160, 262, x1, 278), "#OS 9837 9758 0GB#", fontsize=7)
+    p.draw_line((x0, 282), (x1, 282), color=(0, 0, 0), width=0.8)
+    _text(p, (x0 + 25, 289, x0 + 200, 360),
+          "Cycleon Returns\nNational Distribution Centre\nNDC\nXX40 2HH", fontsize=10)
+    _text(p, (x0 + 236, 300, x0 + 254, 395), "SENDER'S ADDRESS", fontsize=5, rotate=90)
+    p.draw_line((x0, 400), (x1, 400), color=(0, 0, 0), width=0.8)
+    _text(p, (x0 + 10, 402, x1, 418), "Post Office - scan the above right barcode",
+          fontsize=8, fontname="hebo")
+    p.draw_line((x0, 418), (x1, 418), color=(0, 0, 0), width=0.8)
+    _barcode(p, fitz.Rect(x0 + 10, 422, x0 + 200, 448), seed=6)
+    _text(p, (x0 + 10, 449, x1, 464), "RMA ER100038034064", fontsize=7)
+    _barcode(p, fitz.Rect(x0 + 10, 468, x0 + 210, 492), seed=1)
+    _text(p, (x0 + 10, 494, x1, 510), "Cycleon 00087000005227412071", fontsize=7)
+
+    ix0, ix1 = 450, 730
+    _text(p, (ix0, 68, ix1, 92), "PACKING INSTRUCTIONS", fontsize=12, fontname="hebo")
+    _text(p, (ix0, 94, ix1, 156),
+          "What do you need?\n    - printed return label\n    - Product(s)\n    - a box",
+          fontsize=8)
+    _text(p, (ix0, 158, ix1, 300),
+          "1. Pack your product(s) preferably in the original box and packaging. "
+          "If this is not possible, pack the product(s) in a secure way so that "
+          "they can be shipped safely.\n"
+          "2. Print and attach the return label to your package. Make sure the "
+          "label is clearly visible and remove or cover any old labels and "
+          "barcodes to avoid delivery delays.\n"
+          "3. Take the package to your preferred drop off location and make sure "
+          "to request a proof of posting.\n\n"
+          "If you have any questions about the return process, please refer to "
+          "the Help section on our website or app.", fontsize=8)
+    doc.save(path)
+    doc.close()
+
+
+def case_label_beside_instructions_rotated(path):
+    """Case 09 as an iPhone actually sends it: turned a quarter turn onto portrait A4.
+
+    AirPrint clients re-paginate a landscape sheet onto portrait A4 by
+    rotating it, so the label arrives *below* the instructions, sideways, and
+    the gutter between them is horizontal. The first version of the column
+    split only looked for vertical gutters, passed on the original file, and
+    did nothing on the job the phone sent. Test against what the printer
+    receives, not the file on disk.
+    """
+    tmp = path + ".landscape.pdf"
+    case_label_beside_instructions(tmp)
+    src = fitz.open(tmp)
+    doc = fitz.open()
+    p = doc.new_page(width=A4[0], height=A4[1])
+    p.show_pdf_page(p.rect, src, 0, rotate=90)
+    doc.save(path)
+    doc.close()
+    src.close()
+    os.remove(tmp)
+
+
 CASES = [
     ("01-bordered-label-a4", "pdf", case_bordered_a4,
      "bordered carrier label on A4"),
@@ -315,6 +396,10 @@ CASES = [
      "instructions + cut line, label below"),
     ("08-instruction-page-then-sheet", "pdf", case_instruction_page_then_sheet,
      "text page, then bordered sheet with cut line"),
+    ("09-label-beside-instructions", "pdf", case_label_beside_instructions,
+     "borderless label beside a column of instructions"),
+    ("10-beside-instructions-turned", "pdf", case_label_beside_instructions_rotated,
+     "the same sheet turned onto portrait A4, as an iPhone sends it"),
 ]
 
 
